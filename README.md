@@ -46,3 +46,9 @@
 ## 成员
 
 - 计算机小组
+
+
+## Texas Hold'em project
+
+The complete Python game, tests, midterm framework, and presentation are included in this repository.
+See [TEXAS_HOLDEM_README.md](./TEXAS_HOLDEM_README.md) for setup and project details.
