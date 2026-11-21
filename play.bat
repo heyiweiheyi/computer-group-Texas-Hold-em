@@ -2,6 +2,13 @@
 setlocal
 cd /d "%~dp0"
 
+if not exist "%~dp0texas_holdem_gui.py" (
+    echo [Error] texas_holdem_gui.py was not found in this folder.
+    echo Please download the full repository ZIP ^(Code -^> Download ZIP^), extract all files, and run play.bat inside that folder.
+    pause
+    exit /b 1
+)
+
 set "PY_CMD="
 set "PYW_CMD="
 
