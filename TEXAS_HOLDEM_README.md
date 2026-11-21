@@ -4,7 +4,9 @@ A 2-to-6 player (1 human vs. 1–5 computer opponents) Texas Hold'em game writte
 
 ## Run the Graphical UI (Recommended)
 
-Requires Python 3.8+ and `pygame-ce` (listed in `requirements.txt`):
+On Windows, double-click `play.bat` to automatically install dependencies (if missing) and launch the graphical UI.
+
+Or run from a terminal (requires Python 3.8+ and `pygame-ce` in `requirements.txt`):
 
 ```bash
 py -3 -m pip install -r requirements.txt
