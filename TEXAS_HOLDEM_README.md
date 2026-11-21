@@ -1,10 +1,26 @@
-# Texas Hold'em Terminal Game
+# Texas Hold'em Poker Game
 
-A two-player Texas Hold'em game written with the Python standard library. One person plays against a computer opponent. Play continues across hands until a player runs out of chips or the human player quits.
+A two-player Texas Hold'em game written in Python, featuring both a **Pygame graphical interface** (`texas_holdem_gui.py`) and a **terminal version** (`texas_holdem.py`). One person plays against a computer opponent across hands until a player runs out of chips or quits.
 
-## Run the game
+## Run the Graphical UI (Recommended)
 
-Requires Python 3.8 or newer. Open a terminal in this folder and run:
+Requires Python 3.8+ and `pygame-ce` (listed in `requirements.txt`):
+
+```bash
+py -3 -m pip install -r requirements.txt
+py -3 texas_holdem_gui.py
+```
+
+UI features & shortcuts:
+- **Multi-AI Ring Table (1–5 AI, up to 6 players):** Click `Table: N AI` in the top bar to set the number of computer opponents (capped at 5 AI), starting chips, and blinds, with automatic `D`/`SB`/`BB` rotation, player elimination, and main/side-pot settlement
+- **All-In Runout ("跑马"):** Automatic hole-card reveal, live win-equity percentages (`WIN %`) updated at every street, and choice between **Run Once (`[1]`)** and **Run It Twice (`[2]`)** dual-board split
+- Interactive action buttons (`Fold [F]`, `Check / Call [C]`, `Raise [R]`, `All-In [A]`, `Next Hand [Space]`)
+- Raise slider with `Min`, `1/2 Pot`, `Pot`, and `Max` presets
+- Smooth card dealing animations, winning 5-card showdown highlights, live best-hand indicator, toggleable action log (`[L]`), hand rankings guide (`[H]`), and synthesized sound effects (`[M]` to mute)
+
+## Run the Terminal Version
+
+Open a terminal in this folder and run:
 
 ```bash
 py -3 texas_holdem.py
@@ -20,15 +36,26 @@ After each hand, press Enter to continue or type `q` to quit. Each player starts
 
 ## Project files
 
-- `texas_holdem.py` — the complete game: cards, hand evaluation, players, computer strategy, betting, and terminal interaction.
-- `test_texas_holdem.py` — hand-evaluation and basic game-flow tests using Python's built-in `unittest` module.
+- `texas_holdem.py` — core game rules, cards, hand evaluator, computer strategy, terminal game (`TexasHoldemGame`), and state-driven UI engine (`TexasHoldemSession`).
+- `texas_holdem_gui.py` — Pygame desktop interface, animations, HUD, and event loop.
+- `ui_theme.py` — color palette, typography loader, and smoothing helpers.
+- `ui_assets.py` — 2x supersampled felt table, vector playing cards, chip stacks, and synthesized sound effects.
+- `ui_widgets.py` — reusable buttons, raise slider with presets, and hand-ranking modal.
+- `requirements.txt` — Python dependency (`pygame-ce`) for the graphical interface.
+- `test_texas_holdem.py` and `tests/test_ui_session.py` — `unittest` suites covering hand evaluation, game flow, `TexasHoldemSession`, and headless UI rendering.
 - `midterm_report/texas_holdem_midterm.py` — a very early framework that builds and shuffles a deck, then deals two private cards to each player.
 - `midterm_report/texas_holdem_midterm_report.pptx` — the midterm presentation with speaker notes.
 
-Run the tests from this folder:
+Run all tests from this folder:
 
 ```bash
-py -3 -m unittest -v test_texas_holdem.py
+py -3 -m unittest discover -v
+```
+
+Or with `pytest` (as used by GitHub Actions CI):
+
+```bash
+py -3 -m pytest -q
 ```
 
 ## Game rules and implementation

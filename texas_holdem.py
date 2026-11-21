@@ -264,30 +264,157 @@ class ComputerPlayer(Player):
         return {"action": "call"}
 
 
-class TexasHoldemGame:
-    """Manage a heads-up game, including dealing, betting, and awarding the pot."""
+MAX_COMPUTERS = 5
 
-    def __init__(self, starting_chips=500, small_blind=5, big_blind=10):
+
+def build_side_pots(contributions, folded_flags):
+    """Split player contributions into main and side pots with eligible contenders.
+
+    Returns a list of dicts: [{"amount": int, "eligible": [player_index, ...]}, ...].
+    Consecutive slices with identical eligible contenders are merged.
+    """
+    levels = sorted({amount for amount in contributions if amount > 0})
+    if not levels:
+        return []
+
+    pots = []
+    prev_level = 0
+    for level in levels:
+        slice_size = level - prev_level
+        contributors = [i for i, amount in enumerate(contributions) if amount >= level]
+        pot_amount = slice_size * len(contributors)
+        eligible = [i for i in contributors if not folded_flags[i]]
+        if pot_amount > 0 and eligible:
+            if pots and pots[-1]["eligible"] == eligible:
+                pots[-1]["amount"] += pot_amount
+            else:
+                pots.append({"amount": pot_amount, "eligible": eligible})
+        prev_level = level
+    return pots
+
+
+def estimate_all_in_equities(players, board, contender_indices, samples=220):
+    """Return win/equity percentages (0.0 to 100.0) for each contender in an all-in runout."""
+    if not contender_indices:
+        return {}
+    if len(contender_indices) == 1:
+        return {contender_indices[0]: 100.0}
+
+    used_keys = {(card.rank, card.suit) for card in board}
+    for idx in contender_indices:
+        for card in players[idx].hole_cards:
+            used_keys.add((card.rank, card.suit))
+
+    remaining = [
+        Card(rank, suit)
+        for suit in SUITS
+        for rank in range(2, 15)
+        if (rank, suit) not in used_keys
+    ]
+
+    needed = max(0, 5 - len(board))
+    shares = {idx: 0.0 for idx in contender_indices}
+    total_trials = 0
+
+    def score_board(full_board):
+        nonlocal total_trials
+        best_score = None
+        winners = []
+        for idx in contender_indices:
+            score, _ = evaluate_best_hand(players[idx].hole_cards + full_board)
+            if best_score is None or score > best_score:
+                best_score = score
+                winners = [idx]
+            elif score == best_score:
+                winners.append(idx)
+        share = 1.0 / len(winners)
+        for idx in winners:
+            shares[idx] += share
+        total_trials += 1
+
+    if needed == 0:
+        score_board(list(board))
+    elif needed == 1:
+        for card in remaining:
+            score_board(list(board) + [card])
+    else:
+        trial_count = min(samples, 220)
+        for _ in range(trial_count):
+            drawn = random.sample(remaining, needed)
+            score_board(list(board) + drawn)
+
+    if total_trials == 0:
+        equal = 100.0 / len(contender_indices)
+        return {idx: equal for idx in contender_indices}
+
+    return {idx: (shares[idx] / total_trials) * 100.0 for idx in contender_indices}
+
+
+class TexasHoldemGame:
+    """Manage a 2-to-6 player Texas Hold'em game (1 human + 1..5 computers)."""
+
+    def __init__(
+        self,
+        starting_chips=500,
+        small_blind=5,
+        big_blind=10,
+        num_computers=1,
+        max_computers=MAX_COMPUTERS,
+    ):
+        if num_computers < 1 or num_computers > max_computers:
+            raise ValueError(f"num_computers must be between 1 and {max_computers}.")
         self.small_blind = small_blind
         self.big_blind = big_blind
-        self.players = [
-            Player("You", starting_chips, is_human=True),
-            ComputerPlayer("Computer", starting_chips),
-        ]
-        self.button_index = random.randrange(2)
+        self.max_computers = max_computers
+        self.num_computers = num_computers
+
+        self.players = [Player("You", starting_chips, is_human=True)]
+        for i in range(1, num_computers + 1):
+            name = "Computer" if num_computers == 1 else f"AI {i}"
+            self.players.append(ComputerPlayer(name, starting_chips))
+
+        n = len(self.players)
+        self.button_index = random.randrange(n)
         self.deck = None
         self.board = []
         self.pot = 0
-        self.round_bets = [0, 0]
+        self.round_bets = [0] * n
+        self.hand_contributions = [0] * n
+        self.folded = [False] * n
+        self.eliminated = [False] * n
+
+    def _active_in_match(self):
+        return [i for i, elim in enumerate(self.eliminated) if not elim]
+
+    def _contenders(self):
+        return [
+            i
+            for i in range(len(self.players))
+            if not self.eliminated[i] and not self.folded[i]
+        ]
+
+    def _next_seat(self, start_index, predicate):
+        n = len(self.players)
+        for offset in range(1, n + 1):
+            idx = (start_index + offset) % n
+            if predicate(idx):
+                return idx
+        return None
 
     def _other_player(self, player_index):
-        return 1 - player_index
+        if len(self.players) == 2:
+            return 1 - player_index
+        nxt = self._next_seat(
+            player_index, lambda idx: not self.eliminated[idx] and not self.folded[idx]
+        )
+        return nxt if nxt is not None else player_index
 
     def _put_chips_in_pot(self, player_index, amount):
         player = self.players[player_index]
         actual_amount = player.take_bet(amount)
         self.pot += actual_amount
         self.round_bets[player_index] += actual_amount
+        self.hand_contributions[player_index] += actual_amount
         return actual_amount
 
     def _post_blind(self, player_index, amount, blind_name):
@@ -297,24 +424,46 @@ class TexasHoldemGame:
         if player.chips == 0:
             print(f"{player.name} is all-in.")
 
+    def _blind_positions(self):
+        active = self._active_in_match()
+        if len(active) <= 2:
+            sb = self.button_index
+            bb = self._next_seat(sb, lambda i: not self.eliminated[i])
+            return sb, bb
+        sb = self._next_seat(self.button_index, lambda i: not self.eliminated[i])
+        bb = self._next_seat(sb, lambda i: not self.eliminated[i])
+        return sb, bb
+
     def _deal_hole_cards(self):
-        # Deal one card at a time, starting with the button, for two rounds.
+        # Deal one card at a time clockwise starting left of the button.
+        n = len(self.players)
+        deal_order = []
+        for offset in range(1, n + 1):
+            idx = (self.button_index + offset) % n
+            if not self.eliminated[idx]:
+                deal_order.append(idx)
         for _ in range(2):
-            for player_index in (self.button_index, self._other_player(self.button_index)):
+            for player_index in deal_order:
                 self.players[player_index].hole_cards.append(self.deck.draw())
 
     def _show_table(self, reveal_computer=False):
         human = self.players[0]
-        computer = self.players[1]
         print("\n" + "=" * 54)
-        print(f"You: ${human.chips:<8}  Computer: ${computer.chips:<8}  Pot: ${self.pot}")
+        status_parts = [f"{p.name}: ${p.chips}" for i, p in enumerate(self.players) if not self.eliminated[i]]
+        print("  |  ".join(status_parts) + f"  |  Pot: ${self.pot}")
         board_text = "  ".join(f"[{card}]" for card in self.board) or "(no community cards yet)"
         print(f"Board: {board_text}")
         print(f"Your hand: [{human.hole_cards[0]}] [{human.hole_cards[1]}]")
-        if reveal_computer:
-            print(f"Computer hand: [{computer.hole_cards[0]}] [{computer.hole_cards[1]}]")
-        else:
-            print("Computer hand: [??] [??]")
+        for i in range(1, len(self.players)):
+            if self.eliminated[i]:
+                continue
+            comp = self.players[i]
+            if reveal_computer and not self.folded[i]:
+                print(f"{comp.name} hand: [{comp.hole_cards[0]}] [{comp.hole_cards[1]}]")
+            elif self.folded[i]:
+                print(f"{comp.name} hand: (folded)")
+            else:
+                print(f"{comp.name} hand: [??] [??]")
         print("=" * 54)
 
     def _human_action(self, player_index, to_call, can_raise, min_raise, opponent_all_in):
@@ -368,8 +517,10 @@ class TexasHoldemGame:
 
     def _ask_for_action(self, player_index, to_call, can_raise, min_raise):
         player = self.players[player_index]
-        opponent = self.players[self._other_player(player_index)]
-        opponent_all_in = opponent.chips == 0
+        can_act_others = [
+            i for i in self._contenders() if i != player_index and self.players[i].chips > 0
+        ]
+        opponent_all_in = len(can_act_others) == 0
 
         if player.is_human:
             self._show_table()
@@ -387,191 +538,414 @@ class TexasHoldemGame:
         )
         return action
 
-    def _refund_unmatched_bet(self):
+    def _refund_unmatched_bet(self, quiet=False):
         """Return any unmatched part of the current street's larger contribution."""
-        first_bet, second_bet = self.round_bets
-        if first_bet == second_bet:
-            return
+        if len(self.players) == 2:
+            first_bet, second_bet = self.round_bets
+            if first_bet == second_bet:
+                return None
 
-        higher_index = 0 if first_bet > second_bet else 1
-        difference = abs(first_bet - second_bet)
-        self.players[higher_index].chips += difference
-        self.round_bets[higher_index] -= difference
+            higher_index = 0 if first_bet > second_bet else 1
+            difference = abs(first_bet - second_bet)
+            self.players[higher_index].chips += difference
+            self.round_bets[higher_index] -= difference
+            if self.hand_contributions[higher_index] >= difference:
+                self.hand_contributions[higher_index] -= difference
+            self.pot -= difference
+            message = f"Uncalled bet of ${difference} returned to {self.players[higher_index].name}."
+            if not quiet:
+                print(message)
+            return message
+
+        contenders = self._contenders()
+        if len(contenders) <= 1:
+            return None
+        max_bet = max(self.round_bets[i] for i in contenders)
+        top_players = [i for i in contenders if self.round_bets[i] == max_bet]
+        if len(top_players) != 1:
+            return None
+
+        top_idx = top_players[0]
+        others_can_act = any(
+            self.players[i].chips > 0 for i in contenders if i != top_idx
+        )
+        if others_can_act:
+            return None
+
+        second_bet = max(
+            (self.round_bets[i] for i in contenders if i != top_idx),
+            default=0,
+        )
+        difference = max_bet - second_bet
+        if difference <= 0:
+            return None
+
+        self.players[top_idx].chips += difference
+        self.round_bets[top_idx] -= difference
+        if self.hand_contributions[top_idx] >= difference:
+            self.hand_contributions[top_idx] -= difference
         self.pot -= difference
-        print(f"Uncalled bet of ${difference} returned to {self.players[higher_index].name}.")
+        message = f"Uncalled bet of ${difference} returned to {self.players[top_idx].name}."
+        if not quiet:
+            print(message)
+        return message
 
-    def _run_betting_round(self, first_actor):
-        """Run one street of betting. Return the folder's opponent, if anyone folded."""
-        min_raise = self.big_blind
-        pending = []
+    def _init_betting_round(self, first_actor):
+        """Build the initial turn queue for a betting street."""
+        contenders = self._contenders()
+        if len(contenders) <= 1:
+            return []
 
-        # If a blind made a player all-in before the first action, only a player
-        # who still owes chips gets a chance to call or fold.
-        all_in_indices = [i for i, player in enumerate(self.players) if player.chips == 0]
-        if all_in_indices:
-            if len(all_in_indices) == 2:
-                return None
-            all_in_index = all_in_indices[0]
-            live_index = self._other_player(all_in_index)
-            if self.round_bets[live_index] < self.round_bets[all_in_index]:
-                pending = [live_index]
-            else:
-                return None
-        else:
-            pending = [first_actor, self._other_player(first_actor)]
+        can_act = [i for i in contenders if self.players[i].chips > 0]
+        if not can_act:
+            return []
 
+        max_bet = max(self.round_bets[i] for i in contenders)
+        if len(can_act) == 1:
+            sole = can_act[0]
+            return [sole] if self.round_bets[sole] < max_bet else []
+
+        n = len(self.players)
+        queue = []
+        for offset in range(n):
+            idx = (first_actor + offset) % n
+            if idx in can_act:
+                queue.append(idx)
+        return queue
+
+    def _next_pending_actor(self, pending):
+        """Pop any player who has no legal decision left and return the next actor index or None."""
+        contenders = self._contenders()
+        if len(contenders) <= 1:
+            pending.clear()
+            return None
+
+        max_bet = max((self.round_bets[i] for i in contenders), default=0)
         while pending:
-            player_index = pending.pop(0)
+            player_index = pending[0]
+            if self.eliminated[player_index] or self.folded[player_index]:
+                pending.pop(0)
+                continue
+
             player = self.players[player_index]
-            opponent_index = self._other_player(player_index)
-            opponent = self.players[opponent_index]
-
             if player.chips == 0:
+                pending.pop(0)
                 continue
 
-            to_call = max(0, self.round_bets[opponent_index] - self.round_bets[player_index])
-
-            # Once the opponent is all-in, no raise can be called. If this player
-            # already covers the all-in amount, there is no decision to make.
-            if opponent.chips == 0 and to_call == 0:
+            other_can_act = any(
+                i != player_index and self.players[i].chips > 0 for i in contenders
+            )
+            to_call = max(0, max_bet - self.round_bets[player_index])
+            if not other_can_act and to_call == 0:
+                pending.pop(0)
                 continue
 
-            can_raise = (
-                opponent.chips > 0
-                and player.chips >= to_call + min_raise
-            )
-            action = self._ask_for_action(
-                player_index, to_call, can_raise, min_raise
-            )
-            action_name = action["action"]
+            return player_index
+        return None
 
-            if action_name == "fold":
-                print(f"{player.name} folds.")
-                self._refund_unmatched_bet()
-                return opponent_index
+    def _rebuild_pending_after_raise(self, raiser_index):
+        """Return clockwise queue of all other contenders who still have chips to respond."""
+        n = len(self.players)
+        queue = []
+        for offset in range(1, n):
+            idx = (raiser_index + offset) % n
+            if not self.eliminated[idx] and not self.folded[idx] and self.players[idx].chips > 0:
+                queue.append(idx)
+        return queue
 
-            if action_name == "check":
-                print(f"{player.name} checks.")
+    def _apply_betting_action(self, player_index, action, min_raise, pending):
+        """Apply one validated player action and return updated betting state."""
+        player = self.players[player_index]
+        contenders = self._contenders()
+        max_bet = max((self.round_bets[i] for i in contenders), default=0)
+        to_call = max(0, max_bet - self.round_bets[player_index])
+        action_name = action["action"]
+        logs = []
+        summary = action_name.upper()
 
-            elif action_name == "call":
-                amount = self._put_chips_in_pot(player_index, to_call)
-                if amount == to_call:
-                    print(f"{player.name} calls ${amount}.")
-                else:
-                    print(f"{player.name} calls all-in with the remaining ${amount}.")
+        if action_name == "fold":
+            self.folded[player_index] = True
+            logs.append(f"{player.name} folds.")
+            remaining = self._contenders()
+            if len(remaining) == 1:
+                refund_msg = self._refund_unmatched_bet(quiet=True)
+                if refund_msg:
+                    logs.append(refund_msg)
+                return {
+                    "folded_winner": remaining[0],
+                    "min_raise": min_raise,
+                    "pending": [],
+                    "logs": logs,
+                    "summary": "FOLD",
+                }
+            return {
+                "folded_winner": None,
+                "min_raise": min_raise,
+                "pending": pending,
+                "logs": logs,
+                "summary": "FOLD",
+            }
 
-            elif action_name == "raise":
-                old_current_bet = max(self.round_bets)
-                target_bet = old_current_bet + action["amount"]
-                amount_to_put_in = target_bet - self.round_bets[player_index]
-                self._put_chips_in_pot(player_index, amount_to_put_in)
-                new_current_bet = max(self.round_bets)
+        if action_name == "check":
+            logs.append(f"{player.name} checks.")
+            summary = "CHECK"
+
+        elif action_name == "call":
+            amount = self._put_chips_in_pot(player_index, to_call)
+            if amount == to_call:
+                logs.append(f"{player.name} calls ${amount}.")
+                summary = f"CALL ${amount}"
+            else:
+                logs.append(f"{player.name} calls all-in with the remaining ${amount}.")
+                summary = f"ALL-IN ${amount}"
+
+        elif action_name == "raise":
+            old_current_bet = max_bet
+            target_bet = old_current_bet + action["amount"]
+            amount_to_put_in = target_bet - self.round_bets[player_index]
+            self._put_chips_in_pot(player_index, amount_to_put_in)
+            new_current_bet = max(self.round_bets[i] for i in self._contenders())
+            raise_size = new_current_bet - old_current_bet
+            if raise_size >= min_raise:
+                min_raise = raise_size
+            logs.append(f"{player.name} raises by ${raise_size}; total bet this street: ${new_current_bet}.")
+            summary = f"RAISE +${raise_size}"
+            if player.chips == 0:
+                logs.append(f"{player.name} is all-in.")
+                summary = f"ALL-IN ${new_current_bet}"
+            pending = self._rebuild_pending_after_raise(player_index)
+
+        elif action_name == "all_in":
+            old_current_bet = max_bet
+            amount = self._put_chips_in_pot(player_index, player.chips)
+            new_current_bet = max(self.round_bets[i] for i in self._contenders())
+            logs.append(f"{player.name} goes all-in for ${amount}.")
+            summary = f"ALL-IN ${amount}"
+            if new_current_bet > old_current_bet:
                 raise_size = new_current_bet - old_current_bet
                 if raise_size >= min_raise:
                     min_raise = raise_size
-                print(f"{player.name} raises by ${raise_size}; total bet this street: ${new_current_bet}.")
-                if player.chips == 0:
-                    print(f"{player.name} is all-in.")
-                # A raise gives the other player a fresh chance to respond.
-                pending = [opponent_index]
+                pending = [
+                    idx
+                    for idx in self._rebuild_pending_after_raise(player_index)
+                    if self.round_bets[idx] < new_current_bet
+                ]
 
-            elif action_name == "all_in":
-                old_current_bet = max(self.round_bets)
-                amount = self._put_chips_in_pot(player_index, player.chips)
-                new_current_bet = max(self.round_bets)
-                print(f"{player.name} goes all-in for ${amount}.")
-                if new_current_bet > old_current_bet:
-                    raise_size = new_current_bet - old_current_bet
-                    if raise_size >= min_raise:
-                        min_raise = raise_size
-                    if opponent.chips > 0 and self.round_bets[opponent_index] < new_current_bet:
-                        pending = [opponent_index]
+        return {
+            "folded_winner": None,
+            "min_raise": min_raise,
+            "pending": pending,
+            "logs": logs,
+            "summary": summary,
+        }
 
-            # When everyone who can still act has responded, this street is over.
-            # Any unmatched all-in excess is returned before the next street.
+    def _run_betting_round(self, first_actor):
+        """Run one street of betting. Return the sole remaining player if all others folded."""
+        min_raise = self.big_blind
+        pending = self._init_betting_round(first_actor)
+
+        while True:
+            player_index = self._next_pending_actor(pending)
+            if player_index is None:
+                if any(self.players[i].chips == 0 for i in self._contenders()):
+                    self._refund_unmatched_bet()
+                break
+
+            pending.pop(0)
+            player = self.players[player_index]
+            contenders = self._contenders()
+            max_bet = max((self.round_bets[i] for i in contenders), default=0)
+            to_call = max(0, max_bet - self.round_bets[player_index])
+            others_can_act = any(
+                i != player_index and self.players[i].chips > 0 for i in contenders
+            )
+            can_raise = others_can_act and player.chips >= to_call + min_raise
+            action = self._ask_for_action(
+                player_index, to_call, can_raise, min_raise
+            )
+            result = self._apply_betting_action(player_index, action, min_raise, pending)
+            for line in result["logs"]:
+                print(line)
+            if result["folded_winner"] is not None:
+                return result["folded_winner"]
+
+            min_raise = result["min_raise"]
+            pending = result["pending"]
+
             if not pending:
-                if any(current_player.chips == 0 for current_player in self.players):
+                if any(self.players[i].chips == 0 for i in self._contenders()):
                     self._refund_unmatched_bet()
                 break
 
         return None
 
-    def _deal_flop(self):
+    def _deal_flop(self, quiet=False):
         self.deck.burn()
         self.board.extend([self.deck.draw(), self.deck.draw(), self.deck.draw()])
-        print("\nFlop: " + "  ".join(f"[{card}]" for card in self.board))
+        if not quiet:
+            print("\nFlop: " + "  ".join(f"[{card}]" for card in self.board))
 
-    def _deal_turn_or_river(self, street_name):
+    def _deal_turn_or_river(self, street_name, quiet=False):
         self.deck.burn()
         self.board.append(self.deck.draw())
-        print(f"\n{street_name}: [{self.board[-1]}]")
+        if not quiet:
+            print(f"\n{street_name}: [{self.board[-1]}]")
 
-    def _award_pot(self, winner_index):
+    def _award_pot(self, winner_index, quiet=False):
         winner = self.players[winner_index]
-        winner.chips += self.pot
-        print(f"{winner.name} wins the pot of ${self.pot}.")
+        pot_won = self.pot
+        winner.chips += pot_won
+        if not quiet:
+            print(f"{winner.name} wins the pot of ${pot_won}.")
+        self.pot = 0
+        return pot_won
+
+    def _build_active_pots(self):
+        """Build side pots from hand contributions, falling back to single pot if edited directly."""
+        contenders = self._contenders()
+        if sum(self.hand_contributions) == self.pot and self.pot > 0:
+            pots = build_side_pots(self.hand_contributions, self.folded)
+            if pots:
+                return pots
+        return [{"amount": self.pot, "eligible": contenders}] if self.pot > 0 else []
+
+    def _settle_pots_on_board(self, board, pots):
+        """Evaluate contenders on a 5-card board and distribute pot amounts."""
+        contenders = self._contenders()
+        player_results = {}
+        for idx in contenders:
+            score, best_five = evaluate_best_hand(self.players[idx].hole_cards + board)
+            player_results[idx] = {
+                "score": score,
+                "best_five": best_five,
+                "hand_name": HAND_NAMES[score[0]],
+            }
+
+        pot_awards = []
+        total_by_player = {idx: 0 for idx in range(len(self.players))}
+        n = len(self.players)
+
+        for pot_idx, pot_info in enumerate(pots):
+            amount = pot_info["amount"]
+            eligible = [idx for idx in pot_info["eligible"] if idx in player_results]
+            if not eligible or amount <= 0:
+                continue
+
+            best_score = max(player_results[idx]["score"] for idx in eligible)
+            winners = [idx for idx in eligible if player_results[idx]["score"] == best_score]
+
+            # Order winners clockwise from button for standard odd-chip rule
+            ordered_winners = []
+            for offset in range(1, n + 1):
+                seat = (self.button_index + offset) % n
+                if seat in winners:
+                    ordered_winners.append(seat)
+
+            share = amount // len(ordered_winners)
+            remainder = amount % len(ordered_winners)
+            for pos, w_idx in enumerate(ordered_winners):
+                gain = share + (1 if pos < remainder else 0)
+                self.players[w_idx].chips += gain
+                total_by_player[w_idx] += gain
+
+            pot_awards.append(
+                {
+                    "pot_name": "Main Pot" if pot_idx == 0 else f"Side Pot {pot_idx}",
+                    "amount": amount,
+                    "winners": ordered_winners,
+                    "share": share,
+                }
+            )
+
+        return {
+            "board": list(board),
+            "player_results": player_results,
+            "pot_awards": pot_awards,
+            "total_by_player": total_by_player,
+        }
+
+    def _resolve_showdown(self, quiet=False):
+        """Evaluate hands at showdown, award main/side pots, and return structured results."""
+        refund_msg = self._refund_unmatched_bet(quiet=quiet)
+        pot_total = self.pot
+        pots = self._build_active_pots()
+        board_res = self._settle_pots_on_board(self.board, pots)
         self.pot = 0
 
-    def _showdown(self):
-        self._refund_unmatched_bet()
-        self._show_table(reveal_computer=True)
-
-        results = []
-        for player in self.players:
-            score, best_five = evaluate_best_hand(player.hole_cards + self.board)
-            results.append((score, best_five))
-            cards_text = " ".join(f"[{card}]" for card in best_five)
-            print(f"{player.name}: {HAND_NAMES[score[0]]}; best five cards: {cards_text}")
-
-        human_score = results[0][0]
-        computer_score = results[1][0]
-        if human_score > computer_score:
-            self._award_pot(0)
-        elif computer_score > human_score:
-            self._award_pot(1)
+        # Backward-compatible list indexed by seat (None for folded/eliminated)
+        results_list = [board_res["player_results"].get(i) for i in range(len(self.players))]
+        main_award = board_res["pot_awards"][0] if board_res["pot_awards"] else None
+        if main_award and len(main_award["winners"]) == 1:
+            winner_index = main_award["winners"][0]
+            half_pot = pot_total
+            odd_chip = 0
         else:
-            half_pot = self.pot // 2
-            self.players[0].chips += half_pot
-            self.players[1].chips += half_pot
-            odd_chip = self.pot % 2
-            if odd_chip:
-                # In heads-up play, give an odd chip to the big blind (left of button).
-                self.players[self._other_player(self.button_index)].chips += odd_chip
-            print(f"Tie! The pot is split; each player receives ${half_pot}.")
-            self.pot = 0
+            winner_index = None
+            half_pot = main_award["share"] if main_award else 0
+            odd_chip = pot_total % 2 if len(self._contenders()) == 2 else 0
+
+        return {
+            "refund_log": refund_msg,
+            "player_results": results_list,
+            "pot_awards": board_res["pot_awards"],
+            "total_by_player": board_res["total_by_player"],
+            "winner_index": winner_index,
+            "pot_awarded": pot_total,
+            "half_pot": half_pot,
+            "odd_chip": odd_chip,
+        }
+
+    def _showdown(self):
+        self._show_table(reveal_computer=True)
+        showdown = self._resolve_showdown(quiet=True)
+        if showdown["refund_log"]:
+            print(showdown["refund_log"])
+        for idx, (player, result) in enumerate(zip(self.players, showdown["player_results"])):
+            if result is None:
+                continue
+            cards_text = " ".join(f"[{card}]" for card in result["best_five"])
+            print(f"{player.name}: {result['hand_name']}; best five cards: {cards_text}")
+
+        for award in showdown["pot_awards"]:
+            winner_names = ", ".join(self.players[i].name for i in award["winners"])
+            if len(award["winners"]) == 1:
+                print(f"{winner_names} wins {award['pot_name']} of ${award['amount']}.")
+            else:
+                print(f"Tie for {award['pot_name']} (${award['amount']}) between {winner_names}.")
 
     def play_hand(self):
-        """Deal and play a single hand. Returns True if a player folded."""
+        """Deal and play a single hand. Returns True if everyone else folded."""
         self.deck = Deck()
         self.board = []
         self.pot = 0
-        self.round_bets = [0, 0]
+        n = len(self.players)
+        self.round_bets = [0] * n
+        self.hand_contributions = [0] * n
+        self.folded = [self.eliminated[i] for i in range(n)]
         for player in self.players:
             player.hole_cards = []
 
-        small_blind_index = self.button_index
-        big_blind_index = self._other_player(self.button_index)
-
+        small_blind_index, big_blind_index = self._blind_positions()
         self._deal_hole_cards()
         print("\n" + "#" * 54)
-        print(f"Button / small blind: {self.players[small_blind_index].name}; big blind: {self.players[big_blind_index].name}")
+        print(
+            f"Button: {self.players[self.button_index].name}; "
+            f"SB: {self.players[small_blind_index].name}; BB: {self.players[big_blind_index].name}"
+        )
         self._post_blind(small_blind_index, self.small_blind, "small blind")
         self._post_blind(big_blind_index, self.big_blind, "big blind")
 
-        folded_winner = self._run_betting_round(small_blind_index)
+        active_count = len(self._active_in_match())
+        pre_first = small_blind_index if active_count <= 2 else self._next_seat(
+            big_blind_index, lambda i: not self.eliminated[i]
+        )
+        folded_winner = self._run_betting_round(pre_first)
         if folded_winner is not None:
             self._award_pot(folded_winner)
             return True
 
-        if all(player.chips == 0 for player in self.players):
-            self._deal_flop()
-            self._deal_turn_or_river("Turn")
-            self._deal_turn_or_river("River")
-            self._showdown()
-            return False
-
-        if any(player.chips == 0 for player in self.players):
-            # The remaining player has matched the all-in. Deal the rest of the board.
+        can_act = [i for i in self._contenders() if self.players[i].chips > 0]
+        if len(can_act) <= 1:
             self._deal_flop()
             self._deal_turn_or_river("Turn")
             self._deal_turn_or_river("River")
@@ -586,15 +960,19 @@ class TexasHoldemGame:
 
         for _, deal_street in streets:
             deal_street()
-            self.round_bets = [0, 0]
-            first_actor = self._other_player(self.button_index)
-            folded_winner = self._run_betting_round(first_actor)
-            if folded_winner is not None:
-                self._award_pot(folded_winner)
-                return True
+            self.round_bets = [0] * n
+            first_actor = self._next_seat(
+                self.button_index,
+                lambda i: not self.eliminated[i] and not self.folded[i] and self.players[i].chips > 0,
+            )
+            if first_actor is not None:
+                folded_winner = self._run_betting_round(first_actor)
+                if folded_winner is not None:
+                    self._award_pot(folded_winner)
+                    return True
 
-            if any(player.chips == 0 for player in self.players):
-                # Nobody can place another wager, so finish the board automatically.
+            can_act = [i for i in self._contenders() if self.players[i].chips > 0]
+            if len(can_act) <= 1:
                 while len(self.board) < 5:
                     if len(self.board) == 3:
                         self._deal_turn_or_river("Turn")
@@ -607,34 +985,512 @@ class TexasHoldemGame:
 
     def run(self):
         print("=" * 54)
-        print("Texas Hold'em: You vs. Computer")
+        print(f"Texas Hold'em: You vs. {self.num_computers} Computer(s)")
         print(f"Starting chips: ${self.players[0].chips} each; blinds: ${self.small_blind}/${self.big_blind}")
-        print("In heads-up play, the button is also the small blind. The button rotates after each hand.")
-        print("A raise amount is added on top of the call. An all-in uses your entire remaining stack.")
         print("Choose an action by entering its menu number. Press Enter for the next hand or type q to quit.")
 
         hand_number = 1
-        while self.players[0].chips > 0 and self.players[1].chips > 0:
+        while self.players[0].chips > 0 and any(p.chips > 0 for p in self.players[1:]):
             print(f"\nHand {hand_number}")
             self.play_hand()
-            self.button_index = self._other_player(self.button_index)
-            hand_number += 1
-
-            if self.players[0].chips == 0 or self.players[1].chips == 0:
+            for i, p in enumerate(self.players):
+                if p.chips <= 0:
+                    self.eliminated[i] = True
+            if self.players[0].chips <= 0 or all(self.eliminated[1:]):
                 break
+
+            nxt_btn = self._next_seat(self.button_index, lambda i: not self.eliminated[i])
+            if nxt_btn is not None:
+                self.button_index = nxt_btn
+            hand_number += 1
 
             answer = input("Press Enter for the next hand, or type q to quit: ").strip().lower()
             if answer == "q":
                 break
 
         print("\nGame over.")
-        print(f"Your chips: ${self.players[0].chips}; computer chips: ${self.players[1].chips}")
-        if self.players[0].chips > self.players[1].chips:
-            print("You finished with more chips.")
-        elif self.players[1].chips > self.players[0].chips:
-            print("The computer finished with more chips.")
+        for i, p in enumerate(self.players):
+            print(f"{p.name}: ${p.chips}")
+
+
+class TexasHoldemSession:
+    """State-driven wrapper around TexasHoldemGame for graphical interfaces."""
+
+    def __init__(
+        self,
+        starting_chips=500,
+        small_blind=5,
+        big_blind=10,
+        num_computers=1,
+        max_computers=MAX_COMPUTERS,
+    ):
+        self.starting_chips = starting_chips
+        self.small_blind = small_blind
+        self.big_blind = big_blind
+        self.max_computers = max_computers
+        self.num_computers = max(1, min(max_computers, num_computers))
+        self.game = None
+        self.phase = "idle"
+        self.street = "pre_flop"
+        self.hand_number = 0
+        self.min_raise = big_blind
+        self.pending = []
+        self.last_actions = []
+        self.action_log = []
+        self.winner_index = None
+        self.win_reason = None
+        self.showdown_result = None
+        self.pot_awarded = 0
+        self.equities = {}
+        self.run_count = 1
+        self.run_boards = []
+        self.run_results = []
+        self.start_new_match()
+
+    def _append_log(self, message):
+        self.action_log.append(message)
+        if len(self.action_log) > 60:
+            self.action_log = self.action_log[-60:]
+
+    def start_new_match(
+        self,
+        num_computers=None,
+        starting_chips=None,
+        small_blind=None,
+        big_blind=None,
+    ):
+        """Reset all chip stacks with optional updated table settings and begin hand #1."""
+        if num_computers is not None:
+            self.num_computers = max(1, min(self.max_computers, int(num_computers)))
+        if starting_chips is not None:
+            self.starting_chips = int(starting_chips)
+        if small_blind is not None:
+            self.small_blind = int(small_blind)
+        if big_blind is not None:
+            self.big_blind = int(big_blind)
+
+        self.game = TexasHoldemGame(
+            starting_chips=self.starting_chips,
+            small_blind=self.small_blind,
+            big_blind=self.big_blind,
+            num_computers=self.num_computers,
+            max_computers=self.max_computers,
+        )
+        self.hand_number = 0
+        self.action_log = []
+        self.start_next_hand()
+
+    def start_next_hand(self):
+        """Deal the next hand, eliminating busted players and rotating the button."""
+        for i, player in enumerate(self.game.players):
+            if player.chips <= 0:
+                self.game.eliminated[i] = True
+
+        if self.game.eliminated[0] or all(self.game.eliminated[1:]):
+            self.phase = "match_over"
+            return False
+
+        if self.hand_number > 0:
+            nxt_btn = self.game._next_seat(
+                self.game.button_index, lambda i: not self.game.eliminated[i]
+            )
+            if nxt_btn is not None:
+                self.game.button_index = nxt_btn
+
+        self.hand_number += 1
+        n = len(self.game.players)
+        self.game.deck = Deck()
+        self.game.board = []
+        self.game.pot = 0
+        self.game.round_bets = [0] * n
+        self.game.hand_contributions = [0] * n
+        self.game.folded = [self.game.eliminated[i] for i in range(n)]
+        for player in self.game.players:
+            player.hole_cards = []
+
+        self.street = "pre_flop"
+        self.min_raise = self.game.big_blind
+        self.last_actions = [
+            "OUT" if self.game.eliminated[i] else "" for i in range(n)
+        ]
+        self.winner_index = None
+        self.win_reason = None
+        self.showdown_result = None
+        self.pot_awarded = 0
+        self.equities = {}
+        self.run_count = 1
+        self.run_boards = []
+        self.run_results = []
+
+        self.game._deal_hole_cards()
+        small_blind_index, big_blind_index = self.game._blind_positions()
+
+        self._append_log(f"--- Hand #{self.hand_number} ---")
+        sb_amount = self.game._put_chips_in_pot(small_blind_index, self.game.small_blind)
+        bb_amount = self.game._put_chips_in_pot(big_blind_index, self.game.big_blind)
+
+        self.last_actions[small_blind_index] = f"SB ${sb_amount}"
+        self.last_actions[big_blind_index] = f"BB ${bb_amount}"
+        self._append_log(f"{self.game.players[small_blind_index].name} posts SB ${sb_amount}.")
+        self._append_log(f"{self.game.players[big_blind_index].name} posts BB ${bb_amount}.")
+
+        active_count = len(self.game._active_in_match())
+        first_actor = (
+            small_blind_index
+            if active_count <= 2
+            else self.game._next_seat(big_blind_index, lambda i: not self.game.eliminated[i])
+        )
+        self.pending = self.game._init_betting_round(first_actor)
+        self._advance_state()
+        return True
+
+    def _update_equities(self, board_for_calc=None):
+        board = self.game.board if board_for_calc is None else board_for_calc
+        contenders = self.game._contenders()
+        self.equities = estimate_all_in_equities(self.game.players, board, contenders)
+
+    def _complete_showdown(self):
+        self.street = "showdown"
+        if self.run_count == 2 and len(self.run_boards) == 2:
+            self._complete_run_it_twice_showdown()
+            return
+
+        showdown = self.game._resolve_showdown(quiet=True)
+        self.showdown_result = showdown
+        self.winner_index = showdown["winner_index"]
+        self.win_reason = "showdown"
+        self.pot_awarded = showdown["pot_awarded"]
+        self.phase = "hand_over"
+        self._update_equities(self.game.board)
+
+        if showdown["refund_log"]:
+            self._append_log(showdown["refund_log"])
+        for idx, result in enumerate(showdown["player_results"]):
+            if result is not None:
+                self._append_log(f"{self.game.players[idx].name}: {result['hand_name']}")
+        for award in showdown["pot_awards"]:
+            winner_names = ", ".join(self.game.players[i].name for i in award["winners"])
+            if len(award["winners"]) == 1:
+                w_idx = award["winners"][0]
+                verb = "win" if w_idx == 0 else "wins"
+                self._append_log(f"{winner_names} {verb} {award['pot_name']} (${award['amount']})!")
+            else:
+                self._append_log(f"Split {award['pot_name']} (${award['amount']}): {winner_names}.")
+
+    def _complete_run_it_twice_showdown(self):
+        refund_msg = self.game._refund_unmatched_bet(quiet=True)
+        pot_total = self.game.pot
+        pots = self.game._build_active_pots()
+
+        # Split each pot into Run 1 (gets odd chip) and Run 2
+        pots_run1 = []
+        pots_run2 = []
+        for pot_info in pots:
+            amt = pot_info["amount"]
+            half1 = amt // 2 + (amt % 2)
+            half2 = amt // 2
+            if half1 > 0:
+                pots_run1.append({"amount": half1, "eligible": pot_info["eligible"]})
+            if half2 > 0:
+                pots_run2.append({"amount": half2, "eligible": pot_info["eligible"]})
+
+        res1 = self.game._settle_pots_on_board(self.run_boards[0], pots_run1)
+        res2 = self.game._settle_pots_on_board(self.run_boards[1], pots_run2)
+        self.game.pot = 0
+
+        total_by_player = {
+            i: res1["total_by_player"][i] + res2["total_by_player"][i]
+            for i in range(len(self.game.players))
+        }
+        top_gain = max(total_by_player.values(), default=0)
+        top_players = [i for i, g in total_by_player.items() if g == top_gain and g > 0]
+
+        self.run_results = [res1, res2]
+        contenders = self.game._contenders()
+        eq1 = estimate_all_in_equities(self.game.players, self.run_boards[0], contenders)
+        eq2 = estimate_all_in_equities(self.game.players, self.run_boards[1], contenders)
+        self.equities = {
+            idx: 0.5 * (eq1.get(idx, 0.0) + eq2.get(idx, 0.0)) for idx in contenders
+        }
+        self.winner_index = top_players[0] if len(top_players) == 1 else None
+        self.win_reason = "showdown"
+        self.pot_awarded = pot_total
+        self.phase = "hand_over"
+        self.showdown_result = {
+            "refund_log": refund_msg,
+            "player_results": [res1["player_results"].get(i) for i in range(len(self.game.players))],
+            "pot_awards": res1["pot_awards"] + res2["pot_awards"],
+            "total_by_player": total_by_player,
+            "winner_index": self.winner_index,
+            "pot_awarded": pot_total,
+            "run_it_twice": True,
+            "run_results": [res1, res2],
+        }
+
+        if refund_msg:
+            self._append_log(refund_msg)
+        for run_idx, res in enumerate((res1, res2), start=1):
+            for award in res["pot_awards"]:
+                w_names = ", ".join(self.game.players[i].name for i in award["winners"])
+                self._append_log(f"Run {run_idx} ({award['pot_name']} ${award['amount']}): {w_names}")
+
+    def _advance_street(self):
+        if self.street == "pre_flop":
+            self.game._deal_flop(quiet=True)
+            self.street = "flop"
+            self._append_log("Flop: " + " ".join(str(card) for card in self.game.board))
+        elif self.street == "flop":
+            self.game._deal_turn_or_river("Turn", quiet=True)
+            self.street = "turn"
+            self._append_log(f"Turn: {self.game.board[-1]}")
+        elif self.street == "turn":
+            self.game._deal_turn_or_river("River", quiet=True)
+            self.street = "river"
+            self._append_log(f"River: {self.game.board[-1]}")
+
+        n = len(self.game.players)
+        self.game.round_bets = [0] * n
+        self.min_raise = self.game.big_blind
+        self.last_actions = [
+            "OUT" if self.game.eliminated[i] else ("FOLD" if self.game.folded[i] else "")
+            for i in range(n)
+        ]
+        first_actor = self.game._next_seat(
+            self.game.button_index,
+            lambda i: not self.game.eliminated[i] and not self.game.folded[i] and self.game.players[i].chips > 0,
+        )
+        self.pending = self.game._init_betting_round(first_actor) if first_actor is not None else []
+
+    def _advance_state(self):
+        while True:
+            actor = self.game._next_pending_actor(self.pending)
+            if actor is not None:
+                self.phase = "waiting_human" if actor == 0 else "computer_turn"
+                return
+
+            contenders = self.game._contenders()
+            if len(contenders) == 1:
+                winner = contenders[0]
+                refund_msg = self.game._refund_unmatched_bet(quiet=True)
+                if refund_msg:
+                    self._append_log(refund_msg)
+                self.pot_awarded = self.game._award_pot(winner, quiet=True)
+                self.winner_index = winner
+                self.win_reason = "fold"
+                self.phase = "hand_over"
+                return
+
+            if any(self.game.players[i].chips == 0 for i in contenders):
+                refund_msg = self.game._refund_unmatched_bet(quiet=True)
+                if refund_msg:
+                    self._append_log(refund_msg)
+
+            can_act = [i for i in contenders if self.game.players[i].chips > 0]
+            if len(can_act) <= 1 and len(self.game.board) < 5:
+                self._update_equities(self.game.board)
+                # Offer Run It Once vs Run It Twice when human is still in the all-in pot
+                if not self.game.folded[0] and not self.game.eliminated[0]:
+                    self.phase = "choose_run_count"
+                else:
+                    self.run_count = 1
+                    self.phase = "reveal_board"
+                return
+
+            if self.street == "river" or len(self.game.board) == 5:
+                self._complete_showdown()
+                return
+
+            self._advance_street()
+
+    def choose_run_count(self, count):
+        """Select 1 (Run Once) or 2 (Run It Twice) when all-in before the river."""
+        if self.phase != "choose_run_count":
+            raise RuntimeError("Not waiting for run count selection.")
+        if count not in (1, 2):
+            raise ValueError("Run count must be 1 or 2.")
+
+        self.run_count = count
+        if count == 2:
+            self.run_boards = [list(self.game.board), list(self.game.board)]
+            self._append_log("All-in runout: Running It Twice (2x)!")
         else:
-            print("You finished with equal chip stacks.")
+            self.run_boards = []
+            self._append_log("All-in runout: Running Once (1x).")
+
+        self.phase = "reveal_board"
+        self._update_equities(self.game.board)
+
+    def _deal_cards_into_board(self, target_board, count):
+        if self.game.deck.cards:
+            self.game.deck.burn()
+        for _ in range(count):
+            target_board.append(self.game.deck.draw())
+
+    def step_reveal_board(self):
+        """Deal one remaining community street during an all-in runout."""
+        if self.phase == "choose_run_count":
+            self.choose_run_count(1)
+            return
+
+        if self.phase != "reveal_board":
+            return
+
+        if self.run_count == 2:
+            current_len = len(self.run_boards[0])
+            if current_len == 0:
+                self._deal_cards_into_board(self.run_boards[0], 3)
+                self._deal_cards_into_board(self.run_boards[1], 3)
+                self.street = "flop"
+                self._append_log("Run 1 Flop: " + " ".join(str(c) for c in self.run_boards[0]))
+                self._append_log("Run 2 Flop: " + " ".join(str(c) for c in self.run_boards[1]))
+            elif current_len == 3:
+                self._deal_cards_into_board(self.run_boards[0], 1)
+                self._deal_cards_into_board(self.run_boards[1], 1)
+                self.street = "turn"
+                self._append_log(f"Run 1 Turn: {self.run_boards[0][-1]}  |  Run 2 Turn: {self.run_boards[1][-1]}")
+            elif current_len == 4:
+                self._deal_cards_into_board(self.run_boards[0], 1)
+                self._deal_cards_into_board(self.run_boards[1], 1)
+                self.street = "river"
+                self._append_log(f"Run 1 River: {self.run_boards[0][-1]}  |  Run 2 River: {self.run_boards[1][-1]}")
+
+            self.game.board = list(self.run_boards[0])
+            self._update_equities(self.run_boards[0])
+            if len(self.run_boards[0]) == 5:
+                self._complete_showdown()
+            return
+
+        if len(self.game.board) == 0:
+            self.game._deal_flop(quiet=True)
+            self.street = "flop"
+            self._append_log("Flop: " + " ".join(str(card) for card in self.game.board))
+        elif len(self.game.board) == 3:
+            self.game._deal_turn_or_river("Turn", quiet=True)
+            self.street = "turn"
+            self._append_log(f"Turn: {self.game.board[-1]}")
+        elif len(self.game.board) == 4:
+            self.game._deal_turn_or_river("River", quiet=True)
+            self.street = "river"
+            self._append_log(f"River: {self.game.board[-1]}")
+
+        self._update_equities(self.game.board)
+        if len(self.game.board) == 5:
+            self._complete_showdown()
+
+    def get_legal_human_actions(self):
+        """Return legal choices and bet bounds for the human player."""
+        human = self.game.players[0]
+        contenders = self.game._contenders()
+        max_bet = max((self.game.round_bets[i] for i in contenders), default=0)
+        to_call = max(0, max_bet - self.game.round_bets[0])
+        others_can_act = any(i != 0 and self.game.players[i].chips > 0 for i in contenders)
+        can_raise = others_can_act and human.chips >= to_call + self.min_raise
+        max_raise = max(0, human.chips - to_call)
+        return {
+            "can_fold": to_call > 0,
+            "can_check": to_call == 0,
+            "to_call": to_call,
+            "call_amount": min(to_call, human.chips),
+            "can_raise": can_raise,
+            "min_raise": self.min_raise,
+            "max_raise": max_raise,
+            "can_all_in": others_can_act and human.chips > 0,
+            "all_in_amount": human.chips,
+        }
+
+    def _apply_action_and_advance(self, player_index, action):
+        result = self.game._apply_betting_action(
+            player_index, action, self.min_raise, self.pending
+        )
+        self.last_actions[player_index] = result["summary"]
+        for line in result["logs"]:
+            self._append_log(line)
+
+        if result["folded_winner"] is not None:
+            winner = result["folded_winner"]
+            self.pot_awarded = self.game._award_pot(winner, quiet=True)
+            self.winner_index = winner
+            self.win_reason = "fold"
+            self.phase = "hand_over"
+            winner_name = self.game.players[winner].name
+            verb = "win" if winner == 0 else "wins"
+            self._append_log(f"{winner_name} {verb} ${self.pot_awarded}!")
+            return
+
+        self.min_raise = result["min_raise"]
+        self.pending = result["pending"]
+        self._advance_state()
+
+    def submit_human_action(self, action):
+        """Apply a human action from the UI and advance the hand state."""
+        if self.phase != "waiting_human":
+            raise RuntimeError("Not waiting for human action.")
+
+        legal = self.get_legal_human_actions()
+        action_name = action.get("action")
+        if action_name == "fold" and not legal["can_fold"]:
+            raise ValueError("Cannot fold when there is nothing to call.")
+        if action_name == "check" and not legal["can_check"]:
+            raise ValueError("Cannot check when facing a bet.")
+        if action_name == "call" and legal["to_call"] <= 0:
+            raise ValueError("Nothing to call.")
+        if action_name == "raise":
+            if not legal["can_raise"]:
+                raise ValueError("Raising is not allowed right now.")
+            amount = int(action.get("amount", 0))
+            if amount < legal["min_raise"] or amount > legal["max_raise"]:
+                raise ValueError("Raise amount out of bounds.")
+            action = {"action": "raise", "amount": amount}
+        if action_name == "all_in" and not legal["can_all_in"]:
+            raise ValueError("All-in is not allowed right now.")
+
+        self.pending.pop(0)
+        self._apply_action_and_advance(0, action)
+
+    def step_computer_turn(self):
+        """Let the next computer opponent take one action and advance the hand state."""
+        if self.phase != "computer_turn":
+            raise RuntimeError("Not a computer's turn.")
+
+        comp_index = self.pending.pop(0)
+        computer = self.game.players[comp_index]
+        contenders = self.game._contenders()
+        max_bet = max((self.game.round_bets[i] for i in contenders), default=0)
+        to_call = max(0, max_bet - self.game.round_bets[comp_index])
+        others_can_act = any(
+            i != comp_index and self.game.players[i].chips > 0 for i in contenders
+        )
+        opponent_all_in = not others_can_act
+        can_raise = others_can_act and computer.chips >= to_call + self.min_raise
+        action = computer.choose_action(
+            to_call,
+            can_raise,
+            self.min_raise,
+            self.game.pot,
+            self.game.board,
+            opponent_all_in,
+        )
+        self._apply_action_and_advance(comp_index, action)
+
+    def get_human_best_hand_name(self):
+        """Return a live label for the human player's current hand."""
+        human = self.game.players[0]
+        if self.game.eliminated[0]:
+            return "Eliminated"
+        if self.game.folded[0]:
+            return "Folded"
+        if len(human.hole_cards) < 2:
+            return ""
+        if len(self.game.board) >= 3:
+            score, _ = evaluate_best_hand(human.hole_cards + self.game.board)
+            return HAND_NAMES[score[0]]
+
+        first, second = human.hole_cards
+        if first.rank == second.rank:
+            return "Pocket Pair"
+        if first.suit == second.suit:
+            return "Suited Hand"
+        return "High Card"
 
 
 def main():
