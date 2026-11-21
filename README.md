@@ -47,8 +47,49 @@
 
 - 计算机小组
 
+## 德州扑克项目（Texas Hold'em）
 
-## Texas Hold'em project
+本项目为计算机小组 Python 课程项目，包含 **Pygame 图形界面版** 与 **终端命令行版** 德州扑克，支持单挑（1v1）及多人圆桌（2~6 人），并配套单元测试与 GitHub Actions CI。
 
-The complete Python game, tests, midterm framework, and presentation are included in this repository.
-See [TEXAS_HOLDEM_README.md](./TEXAS_HOLDEM_README.md) for setup and project details.
+### 核心特性
+
+- **Pygame 图形界面（[texas_holdem_gui.py](./texas_holdem_gui.py)）**：深绿绒布牌桌、矢量扑克牌与筹码堆、发牌动画、音效开关、对局日志抽屉与内置牌型速查表。
+- **多电脑圆桌模式**：支持在右上角 `Table: N AI` 中选择 **1~5 台电脑**（最多 6 人同桌），可配置初始筹码与盲注；完整支持 `D / SB / BB` 轮转、淘汰出局与**主池 / 边池拆分结算**。
+- **All-in 跑马体验**：全下亮牌后实时计算各家胜率百分比（`WIN %`）并逐街更新，支持选择 **Run Once（1x）** 或 **Run It Twice（2x）** 双排公共牌独立结算。
+- **终端版本与完整测试**：保留原始命令行模式（[texas_holdem.py](./texas_holdem.py)）与 22 项 `unittest` 自动化测试。
+
+### 快速开始
+
+1. 安装依赖（Python 3.8+）：
+
+   ```bash
+   py -3 -m pip install -r requirements.txt
+   ```
+
+2. 启动图形界面（推荐）：
+
+   ```bash
+   py -3 texas_holdem_gui.py
+   ```
+
+3. 或运行终端命令行版：
+
+   ```bash
+   py -3 texas_holdem.py
+   ```
+
+4. 运行全部测试：
+
+   ```bash
+   py -3 -m unittest -v test_texas_holdem.py tests/test_ui_session.py
+   ```
+
+### 主要文件说明
+
+- `texas_holdem.py`：核心牌型评估、电脑策略、主池/边池计算、命令行入口与状态驱动引擎 `TexasHoldemSession`
+- `texas_holdem_gui.py`：Pygame 图形界面主程序、动画与交互事件循环
+- `ui_theme.py` / `ui_assets.py` / `ui_widgets.py`：界面主题配色、矢量牌面与音效渲染、交互控件与设置弹窗
+- `test_texas_holdem.py` / `tests/test_ui_session.py`：核心规则与多人状态机/无头 UI 单元测试
+- `midterm_report/`：中期原型代码与汇报 PPT
+
+更多英文规则细节与模块导读见 [TEXAS_HOLDEM_README.md](./TEXAS_HOLDEM_README.md)。
