@@ -62,7 +62,11 @@
 
 #### 方式一：Windows 一键启动（推荐）
 
-双击仓库根目录下的 [play.bat](./play.bat) 即可：脚本会自动检测 Python 环境、安装缺失的 `requirements.txt` 依赖并启动图形界面。
+1. 先获取完整仓库文件（任选其一）：
+   - 在 GitHub 仓库页面右上角点击绿色 **`<> Code` → `Download ZIP`** 下载压缩包，并**全部解压**到一个文件夹中；
+   - 或使用 `git clone` 克隆整个仓库到本地。
+   > **注意**：请勿只单独下载 `play.bat` 一个文件，脚本需要与同目录下的 `texas_holdem_gui.py` 等文件一起运行。
+2. 进入解压（或克隆）后的文件夹，直接双击 [play.bat](./play.bat) 即可：脚本会自动检测 Python 环境、安装缺失的 `requirements.txt` 依赖并启动图形界面。
 
 #### 方式二：命令行启动
 
