@@ -53,9 +53,9 @@
 
 ### 核心特性
 
-- **Pygame 图形界面（[texas_holdem_gui.py](./texas_holdem_gui.py)）**：深绿绒布牌桌、矢量扑克牌与筹码堆、发牌动画、音效开关、对局日志抽屉与内置牌型速查表。
-- **多电脑圆桌模式**：支持在右上角 `Table: N AI` 中选择 **1~5 台电脑**（最多 6 人同桌），可配置初始筹码与盲注；完整支持 `D / SB / BB` 轮转、淘汰出局与**主池 / 边池拆分结算**。
-- **All-in 跑马体验**：全下亮牌后实时计算各家胜率百分比（`WIN %`）并**逐张翻牌**更新，支持选择 **Run Once（1x）** 或 **Run It Twice（2x）**（先逐张跑完 Run 1 再逐张跑 Run 2，转牌/河牌拉满悬念）。
+- **Pygame 图形界面（[texas_holdem_gui.py](./texas_holdem_gui.py)）**：精美游戏封面、12 位分级 AI 选人大厅、深绿绒布牌桌、矢量扑克牌与筹码堆、发牌动画、结算汇总弹窗、音效开关与内置牌型速查表。
+- **12 位分级 AI 对手 & 多人圆桌**：支持 2~6 人局（自由选择 1~5 位 AI 对手），内置 `Claude / Jtt (Ultra)`、`Gemini / Chatgpt / Deepseek (Master)`、`Glm / Kimi / Doubao (Pro)`、`Yuanzuo / Zch (Normal)`、`Xrh / Qzr (Rookie)`，不同档位以专属配色区分并具备对应打法强度；完整支持 `D / SB / BB` 轮转、淘汰出局与**主池 / 边池拆分结算**。
+- **All-in 跑马体验**：全下亮牌后慢节奏**逐张翻牌**并实时高亮当前最高胜率领先者（`LEAD • XX.X%` + 牌面发光），支持 **Run Once（1x）** 与 **Run It Twice（2x）**（先跑完 Run 1 再跑 Run 2）。
 - **内置一键更新**：游戏启动时自动后台检测 GitHub `main` 分支是否有新提交；有更新时顶部 `Update !` 按钮亮起红点提示，点击即可一键拉取更新（同时兼容 `git clone` 与 `Download ZIP` 解压用户）并重启生效。
 - **终端版本与完整测试**：保留原始命令行模式（[texas_holdem.py](./texas_holdem.py)）与自动化 `unittest` 测试。
 

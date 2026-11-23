@@ -66,6 +66,44 @@ BADGE_FOLD = (146, 48, 56)
 BADGE_ALLIN = (128, 66, 188)
 BADGE_BLIND = (64, 78, 102)
 
+TIER_COLORS = {
+    "Ultra": {
+        "bg": (164, 34, 62),
+        "border": (245, 197, 66),
+        "text": (255, 232, 156),
+        "accent": (235, 68, 98),
+        "card_bg": (42, 18, 28),
+    },
+    "Master": {
+        "bg": (106, 52, 174),
+        "border": (182, 130, 252),
+        "text": (238, 224, 255),
+        "accent": (158, 102, 242),
+        "card_bg": (28, 20, 44),
+    },
+    "Pro": {
+        "bg": (22, 124, 90),
+        "border": (74, 212, 162),
+        "text": (216, 255, 238),
+        "accent": (46, 186, 138),
+        "card_bg": (16, 34, 30),
+    },
+    "Normal": {
+        "bg": (34, 92, 156),
+        "border": (98, 168, 244),
+        "text": (218, 238, 255),
+        "accent": (74, 148, 230),
+        "card_bg": (18, 28, 42),
+    },
+    "Rookie": {
+        "bg": (64, 74, 90),
+        "border": (124, 138, 158),
+        "text": (196, 206, 220),
+        "accent": (118, 130, 150),
+        "card_bg": (22, 27, 36),
+    },
+}
+
 
 def ease_out_cubic(t):
     """Smooth deceleration curve for card and chip animations."""

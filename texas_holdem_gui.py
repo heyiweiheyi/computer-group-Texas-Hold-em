@@ -50,12 +50,14 @@ from ui_theme import (
     TEXT_MUTED,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
+    TIER_COLORS,
     WINDOW_HEIGHT,
     WINDOW_WIDTH,
     draw_text,
     ease_out_cubic,
     lerp,
 )
+from ui_screens import OpponentSelectScreen, TitleScreen
 from ui_updater import UpdateController
 from ui_widgets import (
     ActionButton,
@@ -127,12 +129,16 @@ class FontManagerWrapper:
 class PokerTableApp:
     """Main Pygame application driving TexasHoldemSession at 60 FPS."""
 
-    def __init__(self, headless=False, num_computers=1, check_updates=None):
+    def __init__(self, headless=False, num_computers=1, check_updates=None, start_screen=None):
         if headless:
             os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
         pygame.init()
         self.headless = headless
+        if start_screen is not None:
+            self.screen_mode = start_screen
+        else:
+            self.screen_mode = "table" if headless else "title"
         if headless:
             self.display_surface = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
         else:
@@ -160,6 +166,8 @@ class PokerTableApp:
             num_computers=num_computers,
             max_computers=MAX_COMPUTERS,
         )
+        self.title_screen = TitleScreen()
+        self.select_screen = OpponentSelectScreen(max_computers=MAX_COMPUTERS)
         self.rules_modal = RulesModal(WINDOW_WIDTH, WINDOW_HEIGHT)
         self.setup_modal = SetupModal(WINDOW_WIDTH, WINDOW_HEIGHT, max_computers=MAX_COMPUTERS)
         self.update_modal = UpdateModal(WINDOW_WIDTH, WINDOW_HEIGHT)
@@ -286,21 +294,21 @@ class PokerTableApp:
         self.sounds.play("card")
 
     def _next_runout_delay(self):
-        """Return suspenseful delay before flipping the next all-in runout card."""
+        """Return slow, suspenseful delay before flipping the next all-in runout card."""
         if self.session.run_count == 2 and len(self.session.run_boards) == 2:
             r1_len = len(self.session.run_boards[0])
             r2_len = len(self.session.run_boards[1])
             if r1_len == 5 and r2_len == self.session.run_start_board_len:
-                return 2.2
+                return 3.0
             cur_len = r1_len if r1_len < 5 else r2_len
         else:
             cur_len = len(self.session.game.board)
 
         if cur_len == 4:
-            return 2.1
+            return 2.9
         if cur_len == 3:
-            return 1.65
-        return 1.25
+            return 2.35
+        return 1.75
 
     def _sync_timers_and_controls(self, reset_raise=False):
         now = time.monotonic()
@@ -479,6 +487,33 @@ class PokerTableApp:
             self.rules_modal.handle_event(event)
             return
 
+        if self.screen_mode == "title":
+            action = self.title_screen.handle_event(event)
+            if action == "start":
+                self.screen_mode = "select"
+            elif action == "rules":
+                self.rules_modal.visible = True
+            elif action == "update":
+                self.update_toast_dismissed = True
+                self.update_modal.visible = True
+                if self.updater.snapshot()["status"] == "idle":
+                    self.updater.check_async()
+            return
+
+        if self.screen_mode == "select":
+            action, payload = self.select_screen.handle_event(event)
+            if action == "back":
+                self.screen_mode = "title"
+            elif action == "start" and payload:
+                self.summary_modal.visible = False
+                self.summary_popup_at = 0.0
+                self.session.start_new_match(**payload)
+                self.prev_pot = self.session.game.pot
+                self._trigger_new_hand_anims()
+                self._sync_timers_and_controls(reset_raise=True)
+                self.screen_mode = "table"
+            return
+
         if self.summary_modal.visible:
             res = self.summary_modal.handle_event(event)
             if res == "next":
@@ -531,12 +566,10 @@ class PokerTableApp:
                 self.updater.check_async()
             return
         if self.btn_setup.handle_event(event):
-            self.setup_modal.open_with(
-                self.session.num_computers,
-                self.session.starting_chips,
-                self.session.small_blind,
-                self.session.big_blind,
-            )
+            self.summary_modal.visible = False
+            self.summary_popup_at = 0.0
+            self.select_screen.sync_from_session(self.session)
+            self.screen_mode = "select"
             return
         if self.btn_log.handle_event(event):
             self.show_log = not self.show_log
@@ -587,6 +620,9 @@ class PokerTableApp:
             self._advance_next_hand_or_match()
 
     def update(self, dt):
+        if self.screen_mode != "table":
+            return
+
         now = time.monotonic()
 
         for i, player in enumerate(self.session.game.players):
@@ -736,6 +772,15 @@ class PokerTableApp:
                 anchor="center",
             )
 
+    def _equity_leaders(self):
+        """Return set of player indices currently leading in win equity during all-in runout."""
+        if self.session.phase not in ("choose_run_count", "reveal_board") or not self.session.equities:
+            return set()
+        top = max(self.session.equities.values(), default=0.0)
+        if top <= 0.0:
+            return set()
+        return {idx for idx, pct in self.session.equities.items() if pct >= top - 0.1}
+
     def _draw_equity_pill(self, x, y, width, player_index):
         if self.session.phase in ("hand_over", "match_over"):
             won = self.session.won_this_hand.get(player_index, 0)
@@ -757,20 +802,20 @@ class PokerTableApp:
         if player_index not in self.session.equities:
             return
         pct = self.session.equities[player_index]
-        max_pct = max(self.session.equities.values(), default=0.0)
-        is_lead = pct >= max_pct - 0.1
+        is_lead = player_index in self._equity_leaders()
 
         pill = pygame.Rect(x, y, width, 20)
         pygame.draw.rect(self.screen, (14, 20, 28), pill, border_radius=6)
         fill_w = max(4, int((width - 2) * min(100.0, pct) / 100.0))
-        fill_col = (34, 148, 102) if is_lead else (66, 92, 132)
+        fill_col = (34, 168, 114) if is_lead else (62, 84, 120)
         pygame.draw.rect(self.screen, fill_col, pygame.Rect(x + 1, y + 1, fill_w, 18), border_radius=5)
-        pygame.draw.rect(self.screen, GOLD_BRIGHT if is_lead else PANEL_BORDER, pill, width=1, border_radius=6)
+        pygame.draw.rect(self.screen, GOLD_BRIGHT if is_lead else PANEL_BORDER, pill, width=2 if is_lead else 1, border_radius=6)
+        label = f"LEAD • {pct:.1f}%" if is_lead else f"WIN {pct:.1f}%"
         draw_text(
             self.screen,
             self.fonts.get(11, bold=True),
-            f"WIN {pct:.1f}%",
-            TEXT_PRIMARY,
+            label,
+            GOLD_BRIGHT if is_lead else TEXT_PRIMARY,
             pill.center,
             anchor="center",
         )
@@ -778,17 +823,28 @@ class PokerTableApp:
     def _draw_human_panel(self, now):
         rect = pygame.Rect(348, 482, 266, 102)
         is_active = self.session.phase == "waiting_human"
+        is_eq_leader = 0 in self._equity_leaders()
         player = self.session.game.players[0]
         chips_val = int(round(self.display_chips[0]))
         last_action = self.session.last_actions[0]
 
-        if is_active:
+        if is_eq_leader:
+            pulse = 0.5 + 0.5 * abs((now * 3.0) % 2.0 - 1.0)
+            glow_col = tuple(int(lerp((42, 196, 134)[i], GOLD_BRIGHT[i], pulse)) for i in range(3))
+            pygame.draw.rect(self.screen, glow_col, rect.inflate(10, 10), width=3, border_radius=16)
+        elif is_active:
             pulse = 0.55 + 0.45 * abs((now * 2.2) % 2.0 - 1.0)
             glow_col = tuple(int(lerp(GOLD_DIM[i], GOLD_BRIGHT[i], pulse)) for i in range(3))
             pygame.draw.rect(self.screen, glow_col, rect.inflate(6, 6), width=2, border_radius=15)
 
         pygame.draw.rect(self.screen, PANEL_BG, rect, border_radius=12)
-        pygame.draw.rect(self.screen, GOLD_MID if is_active else PANEL_BORDER, rect, width=1, border_radius=12)
+        pygame.draw.rect(
+            self.screen,
+            GOLD_BRIGHT if is_eq_leader else (GOLD_MID if is_active else PANEL_BORDER),
+            rect,
+            width=2 if is_eq_leader else 1,
+            border_radius=12,
+        )
 
         avatar_center = (rect.left + 30, rect.top + 32)
         pygame.draw.circle(self.screen, (28, 96, 74), avatar_center, 18)
@@ -828,24 +884,43 @@ class PokerTableApp:
     def _draw_1v1_computer(self, now, reveal_all, winning_set):
         rect = pygame.Rect(374, 94, 248, 92)
         is_active = self.session.phase == "computer_turn" and self.session.pending and self.session.pending[0] == 1
+        is_eq_leader = 1 in self._equity_leaders()
         player = self.session.game.players[1]
+        tier = getattr(player, "tier", "Pro")
+        tc = TIER_COLORS.get(tier, TIER_COLORS["Pro"])
         chips_val = int(round(self.display_chips[1]))
         last_action = self.session.last_actions[1]
 
-        if is_active:
+        if is_eq_leader:
+            pulse = 0.5 + 0.5 * abs((now * 3.0) % 2.0 - 1.0)
+            glow_col = tuple(int(lerp((42, 196, 134)[i], GOLD_BRIGHT[i], pulse)) for i in range(3))
+            pygame.draw.rect(self.screen, glow_col, rect.inflate(10, 10), width=3, border_radius=16)
+        elif is_active:
             pulse = 0.55 + 0.45 * abs((now * 2.2) % 2.0 - 1.0)
             glow_col = tuple(int(lerp(GOLD_DIM[i], GOLD_BRIGHT[i], pulse)) for i in range(3))
             pygame.draw.rect(self.screen, glow_col, rect.inflate(6, 6), width=2, border_radius=15)
 
         pygame.draw.rect(self.screen, PANEL_BG, rect, border_radius=12)
-        pygame.draw.rect(self.screen, GOLD_MID if is_active else PANEL_BORDER, rect, width=1, border_radius=12)
+        pygame.draw.rect(
+            self.screen,
+            GOLD_BRIGHT if is_eq_leader else (GOLD_MID if is_active else tc["accent"]),
+            rect,
+            width=2 if is_eq_leader else 1,
+            border_radius=12,
+        )
 
         avatar_center = (rect.left + 30, rect.top + 32)
-        pygame.draw.circle(self.screen, (42, 68, 108), avatar_center, 18)
-        pygame.draw.circle(self.screen, PANEL_BORDER, avatar_center, 18, width=2)
-        draw_text(self.screen, self.fonts.get(14, bold=True), "AI", TEXT_PRIMARY, avatar_center, anchor="center")
+        pygame.draw.circle(self.screen, tc["bg"], avatar_center, 18)
+        pygame.draw.circle(self.screen, tc["border"], avatar_center, 18, width=2)
+        initials = player.name[:2].upper() if len(player.name) > 3 else player.name.upper()
+        draw_text(self.screen, self.fonts.get(12, bold=True), initials, tc["text"], avatar_center, anchor="center")
 
-        draw_text(self.screen, self.fonts.get(15, bold=True), player.name, TEXT_PRIMARY, (rect.left + 58, rect.top + 13))
+        name_rect = draw_text(self.screen, self.fonts.get(15, bold=True), player.name, TEXT_PRIMARY, (rect.left + 58, rect.top + 11))
+        tier_pill = pygame.Rect(name_rect.right + 8, rect.top + 12, 52, 17)
+        if tier_pill.right < rect.right - 38:
+            pygame.draw.rect(self.screen, tc["bg"], tier_pill, border_radius=5)
+            pygame.draw.rect(self.screen, tc["border"], tier_pill, width=1, border_radius=5)
+            draw_text(self.screen, self.fonts.get(9, bold=True), tier.upper(), tc["text"], tier_pill.center, anchor="center")
         draw_text(self.screen, self.fonts.get(19, bold=True), f"${chips_val}", GOLD_BRIGHT, (rect.left + 58, rect.top + 32))
 
         badge = self._position_badge(1)
@@ -894,12 +969,14 @@ class PokerTableApp:
                 pos,
                 face_up=face_up,
                 small=True,
-                highlighted=(is_showdown and in_best),
+                highlighted=(is_showdown and in_best) or (face_up and is_eq_leader),
                 dimmed=(is_showdown and bool(winning_set) and not in_best),
             )
 
     def _draw_compact_ai_seat(self, player_index, seat_x, seat_y, bet_center, now, reveal_all, winning_set):
         player = self.session.game.players[player_index]
+        tier = getattr(player, "tier", "Pro")
+        tc = TIER_COLORS.get(tier, TIER_COLORS["Pro"])
         eliminated = self.session.game.eliminated[player_index]
         folded = self.session.game.folded[player_index]
         is_active = (
@@ -907,30 +984,42 @@ class PokerTableApp:
             and bool(self.session.pending)
             and self.session.pending[0] == player_index
         )
+        is_eq_leader = (not folded and not eliminated) and (player_index in self._equity_leaders())
 
         # Nameplate (142x80) + 2 mini cards (52x74) side by side
         plate = pygame.Rect(seat_x, seat_y, 142, 80)
-        if is_active:
+        if is_eq_leader:
+            pulse = 0.5 + 0.5 * abs((now * 3.0) % 2.0 - 1.0)
+            glow_col = tuple(int(lerp((42, 196, 134)[i], GOLD_BRIGHT[i], pulse)) for i in range(3))
+            pygame.draw.rect(self.screen, glow_col, plate.inflate(8, 8), width=3, border_radius=13)
+        elif is_active:
             pulse = 0.55 + 0.45 * abs((now * 2.2) % 2.0 - 1.0)
             glow_col = tuple(int(lerp(GOLD_DIM[i], GOLD_BRIGHT[i], pulse)) for i in range(3))
             pygame.draw.rect(self.screen, glow_col, plate.inflate(5, 5), width=2, border_radius=12)
 
         bg_col = (14, 18, 26) if (eliminated or folded) else PANEL_BG
         pygame.draw.rect(self.screen, bg_col, plate, border_radius=10)
+        border_col = GOLD_BRIGHT if is_eq_leader else (GOLD_MID if is_active else (PANEL_BORDER if (eliminated or folded) else tc["accent"]))
         pygame.draw.rect(
             self.screen,
-            GOLD_MID if is_active else PANEL_BORDER,
+            border_col,
             plate,
-            width=1,
+            width=2 if is_eq_leader else 1,
             border_radius=10,
         )
 
+        # Left tier stripe
+        if not eliminated and not folded:
+            pygame.draw.rect(self.screen, tc["accent"], pygame.Rect(plate.left + 2, plate.top + 8, 4, plate.height - 16), border_radius=2)
+
         name_col = TEXT_MUTED if (eliminated or folded) else TEXT_PRIMARY
         chip_col = TEXT_MUTED if (eliminated or folded) else GOLD_BRIGHT
-        draw_text(self.screen, self.fonts.get(13, bold=True), player.name, name_col, (plate.left + 10, plate.top + 8))
+        draw_text(self.screen, self.fonts.get(13, bold=True), player.name, name_col, (plate.left + 11, plate.top + 7))
 
         chips_val = int(round(self.display_chips[player_index]))
-        draw_text(self.screen, self.fonts.get(16, bold=True), f"${chips_val}", chip_col, (plate.left + 10, plate.top + 26))
+        draw_text(self.screen, self.fonts.get(15, bold=True), f"${chips_val}", chip_col, (plate.left + 11, plate.top + 27))
+        if not eliminated and not folded:
+            draw_text(self.screen, self.fonts.get(9, bold=True), tier.upper(), tc["border"], (plate.right - 10, plate.top + 32), anchor="midright")
 
         badge = self._position_badge(player_index)
         if badge:
@@ -982,7 +1071,7 @@ class PokerTableApp:
                     pos,
                     face_up=face_up,
                     card_size=(MINI_CARD_WIDTH, MINI_CARD_HEIGHT),
-                    highlighted=(is_showdown and in_best),
+                    highlighted=(is_showdown and in_best) or (face_up and is_eq_leader),
                     dimmed=(is_showdown and bool(winning_set) and not in_best),
                 )
 
@@ -1131,6 +1220,7 @@ class PokerTableApp:
 
         human = self.session.game.players[0]
         human_folded = self.session.game.folded[0] or self.session.game.eliminated[0]
+        human_eq_lead = (not human_folded) and (0 in self._equity_leaders())
         if not self.session.game.eliminated[0]:
             for idx, card in enumerate(human.hole_cards):
                 tx, ty = HUMAN_CARD_POS[idx]
@@ -1143,7 +1233,7 @@ class PokerTableApp:
                     card,
                     pos,
                     face_up=True,
-                    highlighted=(is_showdown and in_best),
+                    highlighted=(is_showdown and in_best) or human_eq_lead,
                     dimmed=human_folded or (is_showdown and bool(winning_set) and not in_best),
                 )
 
@@ -1298,18 +1388,32 @@ class PokerTableApp:
     def render(self):
         now = time.monotonic()
         self._last_banner_rect = None
-        self.screen.blit(self.table_surface, (0, 0))
-        self._draw_top_bar(now)
-        self._draw_center_table(now)
-        self._draw_players_and_cards(now)
-        self._draw_runout_choice_overlay()
-        self._draw_result_banner()
-        self._draw_bottom_dock()
-        self._draw_log_drawer()
-        self.summary_modal.draw(self.screen, self.fonts.palette, self.session)
-        self.rules_modal.draw(self.screen, self.fonts.palette)
-        self.setup_modal.draw(self.screen, self.fonts.palette)
-        self.update_modal.draw(self.screen, self.fonts.palette, self.updater.snapshot())
+        if self.screen_mode == "title":
+            self.title_screen.draw(
+                self.screen,
+                self.fonts.palette,
+                self.table_surface,
+                self.card_renderer,
+                self.updater.snapshot(),
+                now,
+            )
+            self.rules_modal.draw(self.screen, self.fonts.palette)
+            self.update_modal.draw(self.screen, self.fonts.palette, self.updater.snapshot())
+        elif self.screen_mode == "select":
+            self.select_screen.draw(self.screen, self.fonts.palette)
+        else:
+            self.screen.blit(self.table_surface, (0, 0))
+            self._draw_top_bar(now)
+            self._draw_center_table(now)
+            self._draw_players_and_cards(now)
+            self._draw_runout_choice_overlay()
+            self._draw_result_banner()
+            self._draw_bottom_dock()
+            self._draw_log_drawer()
+            self.summary_modal.draw(self.screen, self.fonts.palette, self.session)
+            self.rules_modal.draw(self.screen, self.fonts.palette)
+            self.setup_modal.draw(self.screen, self.fonts.palette)
+            self.update_modal.draw(self.screen, self.fonts.palette, self.updater.snapshot())
 
         vp = self._viewport_rect
         if vp.width == WINDOW_WIDTH and vp.height == WINDOW_HEIGHT and vp.x == 0 and vp.y == 0:

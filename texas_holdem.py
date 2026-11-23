@@ -168,11 +168,36 @@ class Player:
         return actual_amount
 
 
-class ComputerPlayer(Player):
-    """A balanced opponent that weighs hand strength, pot odds, and stack commitment."""
+AI_TIER_SETTINGS = {
+    "Ultra": {"stars": 5, "noise": 0.015, "tightness": 0.04, "aggression": 1.25, "bluff": 0.04},
+    "Master": {"stars": 4, "noise": 0.03, "tightness": 0.02, "aggression": 1.08, "bluff": 0.03},
+    "Pro": {"stars": 3, "noise": 0.045, "tightness": 0.0, "aggression": 1.0, "bluff": 0.02},
+    "Normal": {"stars": 2, "noise": 0.08, "tightness": -0.03, "aggression": 0.85, "bluff": 0.02},
+    "Rookie": {"stars": 1, "noise": 0.14, "tightness": -0.07, "aggression": 0.65, "bluff": 0.05},
+}
 
-    def __init__(self, name, chips):
+AI_ROSTER = [
+    {"name": "Claude", "tier": "Ultra", "style": "GTO Shark"},
+    {"name": "Jtt", "tier": "Ultra", "style": "Final Boss"},
+    {"name": "Gemini", "tier": "Master", "style": "Sharp Reader"},
+    {"name": "Chatgpt", "tier": "Master", "style": "Balanced Ace"},
+    {"name": "Deepseek", "tier": "Master", "style": "Math Tactician"},
+    {"name": "Glm", "tier": "Pro", "style": "Steady Grinder"},
+    {"name": "Kimi", "tier": "Pro", "style": "Patient Stalker"},
+    {"name": "Doubao", "tier": "Pro", "style": "Tricky Caller"},
+    {"name": "Yuanzuo", "tier": "Normal", "style": "Casual Player"},
+    {"name": "Zch", "tier": "Normal", "style": "Loose Gambler"},
+    {"name": "Xrh", "tier": "Rookie", "style": "Card Tourist"},
+    {"name": "Qzr", "tier": "Rookie", "style": "Chip Donor"},
+]
+
+
+class ComputerPlayer(Player):
+    """A tiered AI opponent that weighs hand strength, pot odds, and stack commitment."""
+
+    def __init__(self, name, chips, tier="Pro"):
         super().__init__(name, chips, is_human=False)
+        self.tier = tier if tier in AI_TIER_SETTINGS else "Pro"
 
     def _has_draw_bonus(self, board):
         """Return a modest bonus for flush draws on the flop or turn."""
@@ -242,19 +267,31 @@ class ComputerPlayer(Player):
         return max(0.05, min(0.95, strength))
 
     def _pick_raise_amount(self, to_call, min_raise, pot):
-        """Pick a disciplined raise increment above the current bet."""
+        """Pick a disciplined raise increment above the current bet scaled by AI tier."""
         max_raise = max(0, self.chips - to_call)
         if max_raise < min_raise:
             return min_raise
         half_pot = max(min_raise, (pot + to_call) // 2)
-        desired = random.choice([min_raise, min_raise, half_pot])
+        two_thirds = max(min_raise, int((pot + to_call) * 0.68))
+        if self.tier == "Ultra":
+            desired = random.choice([half_pot, two_thirds, min_raise])
+        elif self.tier == "Master":
+            desired = random.choice([min_raise, half_pot, two_thirds])
+        elif self.tier == "Rookie":
+            desired = min_raise
+        else:
+            desired = random.choice([min_raise, min_raise, half_pot])
         return max(min_raise, min(max_raise, desired))
 
     def choose_action(self, to_call, can_raise, min_raise, pot, board, opponent_all_in):
-        """Return a balanced action dictionary using strength, pot odds, and stack pressure."""
+        """Return a tier-calibrated action using strength, pot odds, and stack pressure."""
+        cfg = AI_TIER_SETTINGS.get(self.tier, AI_TIER_SETTINGS["Pro"])
         strength = self.estimate_strength(board)
-        # Small per-decision variance so play feels natural rather than mechanical
-        perceived = max(0.0, min(1.0, strength + random.uniform(-0.04, 0.04)))
+        noise = cfg["noise"]
+        perceived = max(0.0, min(1.0, strength + random.uniform(-noise, noise)))
+        tightness = cfg["tightness"]
+        aggression = cfg["aggression"]
+        bluff = cfg["bluff"]
 
         if opponent_all_in or (to_call > 0 and to_call >= self.chips):
             if to_call == 0:
@@ -262,24 +299,23 @@ class ComputerPlayer(Player):
             effective_call = min(to_call, self.chips)
             pot_odds = effective_call / max(1, pot + effective_call)
             stack_ratio = effective_call / max(1, self.chips)
-            # Facing an all-in requires a genuinely strong hand unless price is tiny
-            threshold = 0.36 + pot_odds * 0.42 + stack_ratio * 0.16
+            threshold = 0.36 + tightness + pot_odds * 0.42 + stack_ratio * 0.16
             if perceived >= threshold + 0.06:
                 return {"action": "call"}
-            if perceived >= threshold - 0.05 and random.random() < 0.30:
+            if perceived >= threshold - 0.05 and random.random() < (0.25 if self.tier == "Ultra" else 0.34):
                 return {"action": "call"}
             return {"action": "fold"}
 
         if to_call == 0:
             if can_raise:
-                if perceived >= 0.72:
-                    bet_chance = 0.58
-                elif perceived >= 0.56:
-                    bet_chance = 0.28
+                if perceived >= 0.70:
+                    bet_chance = min(0.85, 0.58 * aggression)
+                elif perceived >= 0.55:
+                    bet_chance = min(0.60, 0.28 * aggression)
                 elif perceived >= 0.44:
-                    bet_chance = 0.10
+                    bet_chance = min(0.30, 0.10 * aggression)
                 else:
-                    bet_chance = 0.03
+                    bet_chance = bluff
 
                 if random.random() < bet_chance:
                     return {
@@ -290,21 +326,19 @@ class ComputerPlayer(Player):
 
         pot_odds = to_call / max(1, pot + to_call)
         stack_commit = to_call / max(1, self.chips)
-        # Facing a bet: require stronger hands as bet size and stack commitment grow
-        preflop_floor = 0.32 if len(board) == 0 else 0.26
+        preflop_floor = (0.32 if len(board) == 0 else 0.26) + tightness
         required_strength = preflop_floor + pot_odds * 0.48 + stack_commit * 0.36
 
         if can_raise:
-            # Dampen re-raising when already facing heavy action to avoid endless raise wars
             heavy_action = stack_commit > 0.20 or to_call > min_raise * 2
-            if perceived >= 0.80:
-                raise_chance = 0.24 if heavy_action else 0.42
-            elif perceived >= 0.66:
-                raise_chance = 0.06 if heavy_action else 0.16
-            elif perceived >= 0.56 and not heavy_action:
-                raise_chance = 0.05
+            if perceived >= 0.78:
+                raise_chance = min(0.75, (0.24 if heavy_action else 0.42) * aggression)
+            elif perceived >= 0.65:
+                raise_chance = min(0.45, (0.06 if heavy_action else 0.16) * aggression)
+            elif perceived >= 0.55 and not heavy_action:
+                raise_chance = min(0.25, 0.05 * aggression)
             else:
-                raise_chance = 0.01 if not heavy_action else 0.0
+                raise_chance = (bluff * 0.5) if not heavy_action else 0.0
 
             if random.random() < raise_chance:
                 return {
@@ -423,7 +457,10 @@ class TexasHoldemGame:
         big_blind=10,
         num_computers=1,
         max_computers=MAX_COMPUTERS,
+        opponents=None,
     ):
+        if opponents is not None:
+            num_computers = len(opponents)
         if num_computers < 1 or num_computers > max_computers:
             raise ValueError(f"num_computers must be between 1 and {max_computers}.")
         self.small_blind = small_blind
@@ -432,9 +469,19 @@ class TexasHoldemGame:
         self.num_computers = num_computers
 
         self.players = [Player("You", starting_chips, is_human=True)]
-        for i in range(1, num_computers + 1):
-            name = "Computer" if num_computers == 1 else f"AI {i}"
-            self.players.append(ComputerPlayer(name, starting_chips))
+        if opponents is not None:
+            for profile in opponents:
+                self.players.append(
+                    ComputerPlayer(
+                        profile["name"],
+                        starting_chips,
+                        tier=profile.get("tier", "Pro"),
+                    )
+                )
+        else:
+            for i in range(1, num_computers + 1):
+                name = "Computer" if num_computers == 1 else f"AI {i}"
+                self.players.append(ComputerPlayer(name, starting_chips))
 
         n = len(self.players)
         self.button_index = random.randrange(n)
@@ -1090,12 +1137,17 @@ class TexasHoldemSession:
         big_blind=10,
         num_computers=1,
         max_computers=MAX_COMPUTERS,
+        opponents=None,
     ):
         self.starting_chips = starting_chips
         self.small_blind = small_blind
         self.big_blind = big_blind
         self.max_computers = max_computers
-        self.num_computers = max(1, min(max_computers, num_computers))
+        self.opponents = list(opponents) if opponents is not None else None
+        if self.opponents is not None:
+            self.num_computers = max(1, min(max_computers, len(self.opponents)))
+        else:
+            self.num_computers = max(1, min(max_computers, num_computers))
         self.game = None
         self.phase = "idle"
         self.street = "pre_flop"
@@ -1132,10 +1184,16 @@ class TexasHoldemSession:
         starting_chips=None,
         small_blind=None,
         big_blind=None,
+        opponents=None,
     ):
         """Reset all chip stacks with optional updated table settings and begin hand #1."""
-        if num_computers is not None:
+        if opponents is not None:
+            self.opponents = list(opponents)[: self.max_computers]
+            self.num_computers = max(1, min(self.max_computers, len(self.opponents)))
+        elif num_computers is not None:
             self.num_computers = max(1, min(self.max_computers, int(num_computers)))
+            if self.opponents is not None and len(self.opponents) != self.num_computers:
+                self.opponents = None
         if starting_chips is not None:
             self.starting_chips = int(starting_chips)
         if small_blind is not None:
@@ -1149,6 +1207,7 @@ class TexasHoldemSession:
             big_blind=self.big_blind,
             num_computers=self.num_computers,
             max_computers=self.max_computers,
+            opponents=self.opponents,
         )
         self.hand_number = 0
         self.action_log = []

@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pygame
 
 from texas_holdem import (
+    AI_ROSTER,
     ComputerPlayer,
     TexasHoldemSession,
     build_side_pots,
@@ -241,6 +242,24 @@ class TexasHoldemSessionTests(unittest.TestCase):
         self.assertFalse(legal_after["can_raise"])
         self.assertFalse(legal_after["can_all_in"])
 
+    def test_custom_ai_roster_names_and_tiers(self):
+        by_name = {item["name"]: item["tier"] for item in AI_ROSTER}
+        expected_names = {
+            "Deepseek", "Claude", "Chatgpt", "Gemini", "Glm", "Kimi",
+            "Jtt", "Yuanzuo", "Xrh", "Zch", "Qzr", "Doubao",
+        }
+        self.assertEqual(set(by_name.keys()), expected_names)
+        self.assertEqual(by_name["Claude"], "Ultra")
+        self.assertEqual(by_name["Jtt"], "Ultra")
+        self.assertEqual(by_name["Xrh"], "Rookie")
+        self.assertEqual(by_name["Qzr"], "Rookie")
+
+        chosen = [item for item in AI_ROSTER if item["name"] in ("Claude", "Jtt", "Xrh")]
+        session = TexasHoldemSession(starting_chips=500, opponents=chosen)
+        self.assertEqual(len(session.game.players), 4)
+        self.assertEqual([p.name for p in session.game.players[1:]], [p["name"] for p in chosen])
+        self.assertEqual([p.tier for p in session.game.players[1:]], [p["tier"] for p in chosen])
+
 
 class UpdaterTests(unittest.TestCase):
     def test_check_for_updates_detects_new_commit_for_zip_install(self):
@@ -284,6 +303,10 @@ class HeadlessGuiTests(unittest.TestCase):
         os.environ["SDL_VIDEODRIVER"] = "dummy"
         os.environ["SDL_AUDIODRIVER"] = "dummy"
         try:
+            app_title = PokerTableApp(headless=True, start_screen="title", check_updates=False)
+            app_title.render()
+            app_title.screen_mode = "select"
+            app_title.render()
             for count in (1, 3, 5):
                 app = PokerTableApp(headless=True, num_computers=count, check_updates=False)
                 app.update(0.016)
