@@ -57,7 +57,14 @@ from ui_theme import (
     lerp,
 )
 from ui_updater import UpdateController
-from ui_widgets import ActionButton, RaiseControl, RulesModal, SetupModal, UpdateModal
+from ui_widgets import (
+    ActionButton,
+    HandSummaryModal,
+    RaiseControl,
+    RulesModal,
+    SetupModal,
+    UpdateModal,
+)
 
 
 DECK_POS = (924, 290)
@@ -125,7 +132,16 @@ class PokerTableApp:
             os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
         pygame.init()
-        self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
+        self.headless = headless
+        if headless:
+            self.display_surface = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
+        else:
+            win_w, win_h = self._compute_initial_window_size()
+            self.display_surface = pygame.display.set_mode((win_w, win_h), pygame.RESIZABLE)
+        self.screen = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT))
+        self._viewport_rect = pygame.Rect(0, 0, self.display_surface.get_width(), self.display_surface.get_height())
+        self._update_viewport()
+
         pygame.display.set_caption("Texas Hold'em — Multi-Player & All-In Runout")
         if not headless and sys.platform == "win32":
             self._ensure_window_visible_windows()
@@ -147,6 +163,7 @@ class PokerTableApp:
         self.rules_modal = RulesModal(WINDOW_WIDTH, WINDOW_HEIGHT)
         self.setup_modal = SetupModal(WINDOW_WIDTH, WINDOW_HEIGHT, max_computers=MAX_COMPUTERS)
         self.update_modal = UpdateModal(WINDOW_WIDTH, WINDOW_HEIGHT)
+        self.summary_modal = HandSummaryModal(WINDOW_WIDTH, WINDOW_HEIGHT)
         self.updater = UpdateController(self.app_dir)
         self.update_toast_dismissed = False
         self._restart_requested = False
@@ -161,14 +178,53 @@ class PokerTableApp:
         self.prev_phase = self.session.phase
         self.ai_wait_until = 0.0
         self.runout_wait_until = 0.0
+        self.summary_popup_at = 0.0
+        self._last_banner_rect = None
 
         self._build_controls()
         self._trigger_new_hand_anims()
-        self._sync_timers_and_controls()
+        self._sync_timers_and_controls(reset_raise=True)
 
         should_check = (not headless) if check_updates is None else bool(check_updates)
         if should_check:
             self.updater.check_async()
+
+    @staticmethod
+    def _compute_initial_window_size():
+        """Fit the 1200x760 table comfortably inside the user's desktop work area."""
+        try:
+            sizes = pygame.display.get_desktop_sizes()
+            if sizes:
+                desk_w, desk_h = sizes[0]
+                max_w = int(desk_w * 0.92)
+                max_h = int(desk_h * 0.86)
+                scale = min(1.0, max_w / WINDOW_WIDTH, max_h / WINDOW_HEIGHT)
+                return max(800, int(WINDOW_WIDTH * scale)), max(506, int(WINDOW_HEIGHT * scale))
+        except Exception:
+            pass
+        return WINDOW_WIDTH, WINDOW_HEIGHT
+
+    def _update_viewport(self):
+        dw, dh = self.display_surface.get_size()
+        scale = min(dw / WINDOW_WIDTH, dh / WINDOW_HEIGHT)
+        vw = max(1, int(WINDOW_WIDTH * scale))
+        vh = max(1, int(WINDOW_HEIGHT * scale))
+        vx = (dw - vw) // 2
+        vy = (dh - vh) // 2
+        self._viewport_rect = pygame.Rect(vx, vy, vw, vh)
+
+    def _map_mouse_event(self, event):
+        if event.type not in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
+            return event
+        vp = self._viewport_rect
+        if vp.width == WINDOW_WIDTH and vp.height == WINDOW_HEIGHT and vp.x == 0 and vp.y == 0:
+            return event
+        mx, my = event.pos
+        lx = int((mx - vp.x) * WINDOW_WIDTH / max(1, vp.width))
+        ly = int((my - vp.y) * WINDOW_HEIGHT / max(1, vp.height))
+        attrs = dict(event.dict)
+        attrs["pos"] = (lx, ly)
+        return pygame.event.Event(event.type, attrs)
 
     @staticmethod
     def _ensure_window_visible_windows():
@@ -246,7 +302,7 @@ class PokerTableApp:
             return 1.65
         return 1.25
 
-    def _sync_timers_and_controls(self):
+    def _sync_timers_and_controls(self, reset_raise=False):
         now = time.monotonic()
         n_ai = self.session.num_computers
         self.btn_setup.label = f"Table: {n_ai} AI"
@@ -274,7 +330,15 @@ class PokerTableApp:
             else:
                 self.btn_call.label = f"Call ${legal['call_amount']}"
 
-            self.raise_control.set_bounds(legal["min_raise"], legal["max_raise"], self.session.game.pot)
+            self.raise_control.set_bounds(
+                legal["min_total_bet"],
+                legal["max_total_bet"],
+                self.session.game.pot,
+                current_bet=legal["current_bet"],
+                to_call=legal["to_call"],
+                is_bet=legal["is_bet"],
+                reset_to_min=reset_raise,
+            )
             self.raise_control.set_enabled(legal["can_raise"])
             self.btn_raise.enabled = legal["can_raise"]
             self.btn_allin.enabled = legal["can_all_in"]
@@ -328,12 +392,27 @@ class PokerTableApp:
                 self.sounds.play("check")
 
         if self.session.phase == "hand_over" and previous_phase != "hand_over":
-            if self.session.winner_index in (0, None):
+            if self.session.won_this_hand.get(0, 0) > 0:
                 self.sounds.play("win")
+            delay = 0.65 if self.session.win_reason == "showdown" else 0.30
+            self.summary_popup_at = time.monotonic() + delay
 
         self.prev_pot = self.session.game.pot
         self.prev_phase = self.session.phase
-        self._sync_timers_and_controls()
+        self._sync_timers_and_controls(reset_raise=(self.session.phase == "waiting_human" and previous_phase != "waiting_human"))
+
+    def _submit_human_raise_from_slider(self):
+        if self.session.phase != "waiting_human":
+            return
+        legal = self.session.get_legal_human_actions()
+        if not legal["can_raise"]:
+            return
+        target_total = self.raise_control.value
+        if target_total >= legal["max_total_bet"] and legal["can_all_in"]:
+            self._submit_human({"action": "all_in"})
+        else:
+            extra_raise = max(legal["min_raise"], min(legal["max_raise"], target_total - legal["current_bet"]))
+            self._submit_human({"action": "raise", "amount": extra_raise})
 
     def _submit_human(self, action_dict):
         if self.session.phase != "waiting_human":
@@ -352,18 +431,29 @@ class PokerTableApp:
         self._on_state_advanced(prev_phase)
 
     def _advance_next_hand_or_match(self):
+        self.summary_modal.visible = False
+        self.summary_popup_at = 0.0
         if self.session.phase == "hand_over":
             if self.session.start_next_hand():
                 self.prev_pot = self.session.game.pot
                 self._trigger_new_hand_anims()
-            self._sync_timers_and_controls()
+            self._sync_timers_and_controls(reset_raise=True)
         elif self.session.phase == "match_over":
             self.session.start_new_match()
             self.prev_pot = self.session.game.pot
             self._trigger_new_hand_anims()
-            self._sync_timers_and_controls()
+            self._sync_timers_and_controls(reset_raise=True)
 
     def handle_event(self, event):
+        if event.type == pygame.VIDEORESIZE and not self.headless:
+            w = max(640, event.w)
+            h = max(405, event.h)
+            self.display_surface = pygame.display.set_mode((w, h), pygame.RESIZABLE)
+            self._update_viewport()
+            return
+
+        event = self._map_mouse_event(event)
+
         if self.update_modal.visible:
             upd_action = self.update_modal.handle_event(event, self.updater.snapshot())
             if upd_action == "check":
@@ -377,14 +467,22 @@ class PokerTableApp:
         if self.setup_modal.visible:
             new_cfg = self.setup_modal.handle_event(event)
             if new_cfg is not None:
+                self.summary_modal.visible = False
+                self.summary_popup_at = 0.0
                 self.session.start_new_match(**new_cfg)
                 self.prev_pot = self.session.game.pot
                 self._trigger_new_hand_anims()
-                self._sync_timers_and_controls()
+                self._sync_timers_and_controls(reset_raise=True)
             return
 
         if self.rules_modal.visible:
             self.rules_modal.handle_event(event)
+            return
+
+        if self.summary_modal.visible:
+            res = self.summary_modal.handle_event(event)
+            if res == "next":
+                self._advance_next_hand_or_match()
             return
 
         if event.type == pygame.KEYDOWN:
@@ -416,7 +514,7 @@ class PokerTableApp:
                     self._submit_human({"action": "check" if legal["can_check"] else "call"})
                     return
                 if event.key == pygame.K_r and legal["can_raise"]:
-                    self._submit_human({"action": "raise", "amount": self.raise_control.value})
+                    self._submit_human_raise_from_slider()
                     return
                 if event.key == pygame.K_a and legal["can_all_in"]:
                     self._submit_human({"action": "all_in"})
@@ -448,10 +546,23 @@ class PokerTableApp:
         elif self.btn_rules.handle_event(event):
             self.rules_modal.visible = True
         elif self.btn_new_match.handle_event(event):
+            self.summary_modal.visible = False
+            self.summary_popup_at = 0.0
             self.session.start_new_match()
             self.prev_pot = self.session.game.pot
             self._trigger_new_hand_anims()
-            self._sync_timers_and_controls()
+            self._sync_timers_and_controls(reset_raise=True)
+
+        # Clicking the hand-over result banner re-opens the detailed settlement modal
+        if (
+            self.session.phase == "hand_over"
+            and self._last_banner_rect
+            and event.type == pygame.MOUSEBUTTONDOWN
+            and event.button == 1
+            and self._last_banner_rect.collidepoint(event.pos)
+        ):
+            self.summary_modal.visible = True
+            return
 
         if self.session.phase == "choose_run_count":
             if self.btn_run_once.handle_event(event):
@@ -469,7 +580,7 @@ class PokerTableApp:
             legal = self.session.get_legal_human_actions()
             self._submit_human({"action": "check" if legal["can_check"] else "call"})
         elif self.btn_raise.handle_event(event):
-            self._submit_human({"action": "raise", "amount": self.raise_control.value})
+            self._submit_human_raise_from_slider()
         elif self.btn_allin.handle_event(event):
             self._submit_human({"action": "all_in"})
         elif self.btn_next.handle_event(event):
@@ -484,7 +595,15 @@ class PokerTableApp:
         self.display_pot = lerp(self.display_pot, float(self.session.game.pot), min(1.0, dt * 14.0))
 
         if self.btn_raise.enabled:
-            self.btn_raise.label = f"Raise +${self.raise_control.value}"
+            if self.raise_control.is_bet:
+                self.btn_raise.label = f"Bet ${self.raise_control.value}"
+            else:
+                self.btn_raise.label = f"Raise to ${self.raise_control.value}"
+
+        if self.summary_popup_at > 0.0 and now >= self.summary_popup_at:
+            self.summary_popup_at = 0.0
+            if self.session.phase == "hand_over":
+                self.summary_modal.visible = True
 
         if self.session.phase == "computer_turn" and self.ai_wait_until > 0.0 and now >= self.ai_wait_until:
             self.ai_wait_until = 0.0
@@ -517,12 +636,13 @@ class PokerTableApp:
     def _winning_cards_for_board(self, res_dict):
         if not res_dict or not res_dict.get("pot_awards"):
             return set()
+        # Highlight the Main Pot winners' best five cards cleanly (side pots are shown in Summary)
+        main_award = res_dict["pot_awards"][0]
         winning = set()
-        for award in res_dict["pot_awards"]:
-            for w_idx in award["winners"]:
-                p_res = res_dict["player_results"].get(w_idx)
-                if p_res:
-                    winning.update(p_res["best_five"])
+        for w_idx in main_award["winners"]:
+            p_res = res_dict["player_results"].get(w_idx)
+            if p_res:
+                winning.update(p_res["best_five"])
         return winning
 
     def _winning_cards_single(self):
@@ -533,12 +653,14 @@ class PokerTableApp:
             for res in self.session.run_results:
                 combined.update(self._winning_cards_for_board(res))
             return combined
+        awards = self.session.showdown_result.get("pot_awards", [])
+        if not awards:
+            return set()
         winning = set()
-        for award in self.session.showdown_result.get("pot_awards", []):
-            for w_idx in award["winners"]:
-                p_res = self.session.showdown_result["player_results"][w_idx]
-                if p_res:
-                    winning.update(p_res["best_five"])
+        for w_idx in awards[0]["winners"]:
+            p_res = self.session.showdown_result["player_results"][w_idx]
+            if p_res:
+                winning.update(p_res["best_five"])
         return winning
 
     def _position_badge(self, player_index):
@@ -615,6 +737,23 @@ class PokerTableApp:
             )
 
     def _draw_equity_pill(self, x, y, width, player_index):
+        if self.session.phase in ("hand_over", "match_over"):
+            won = self.session.won_this_hand.get(player_index, 0)
+            if won <= 0:
+                return
+            pill = pygame.Rect(x, y, width, 20)
+            pygame.draw.rect(self.screen, (24, 118, 82), pill, border_radius=6)
+            pygame.draw.rect(self.screen, GOLD_BRIGHT, pill, width=1, border_radius=6)
+            draw_text(
+                self.screen,
+                self.fonts.get(11, bold=True),
+                f"WON +${won}",
+                GOLD_BRIGHT,
+                pill.center,
+                anchor="center",
+            )
+            return
+
         if player_index not in self.session.equities:
             return
         pct = self.session.equities[player_index]
@@ -681,7 +820,9 @@ class PokerTableApp:
         if extra:
             draw_text(self.screen, self.fonts.get(12, bold=True), extra, TEXT_SECONDARY, (rect.right - 14, tag_y), anchor="midright")
 
-        if self.session.phase in ("choose_run_count", "reveal_board", "hand_over") and 0 in self.session.equities:
+        if self.session.phase in ("choose_run_count", "reveal_board", "hand_over") and (
+            0 in self.session.equities or self.session.won_this_hand.get(0, 0) > 0
+        ):
             self._draw_equity_pill(rect.left, rect.bottom + 6, rect.width, 0)
 
     def _draw_1v1_computer(self, now, reveal_all, winning_set):
@@ -731,7 +872,9 @@ class PokerTableApp:
         if extra:
             draw_text(self.screen, self.fonts.get(12, bold=True), extra, TEXT_SECONDARY, (rect.right - 14, tag_y), anchor="midright")
 
-        if self.session.phase in ("choose_run_count", "reveal_board", "hand_over") and 1 in self.session.equities:
+        if self.session.phase in ("choose_run_count", "reveal_board", "hand_over") and (
+            1 in self.session.equities or self.session.won_this_hand.get(1, 0) > 0
+        ):
             self._draw_equity_pill(rect.left, rect.top - 24, rect.width, 1)
 
         if self.session.phase not in ("hand_over", "match_over"):
@@ -812,7 +955,7 @@ class PokerTableApp:
 
         if (
             self.session.phase in ("choose_run_count", "reveal_board", "hand_over")
-            and player_index in self.session.equities
+            and (player_index in self.session.equities or self.session.won_this_hand.get(player_index, 0) > 0)
             and not folded
             and not eliminated
         ):
@@ -1084,14 +1227,16 @@ class PokerTableApp:
                 msg = f"POT SPLIT (${pot}) — SEE LOG FOR SIDE POTS"
                 accent = (132, 212, 250)
 
+        if self.session.phase == "hand_over":
+            msg = f"{msg}  [Details]"
         banner_y = 460 if self.session.run_count == 2 else 418
         banner = pygame.Rect(336, banner_y, 528, 34)
         if self.session.run_count == 2:
-            # Place Run It Twice banner neatly in top-of-dock/below board without hitting human panel
             banner = pygame.Rect(618, 598, 550, 32)
+        self._last_banner_rect = banner
         pygame.draw.rect(self.screen, (14, 20, 30), banner, border_radius=16)
         pygame.draw.rect(self.screen, accent, banner, width=1, border_radius=16)
-        draw_text(self.screen, self.fonts.get(14, bold=True), msg, accent, banner.center, anchor="center")
+        draw_text(self.screen, self.fonts.get(13, bold=True), msg, accent, banner.center, anchor="center")
 
     def _draw_bottom_dock(self):
         dock_rect = pygame.Rect(0, 638, WINDOW_WIDTH, WINDOW_HEIGHT - 638)
@@ -1152,6 +1297,7 @@ class PokerTableApp:
 
     def render(self):
         now = time.monotonic()
+        self._last_banner_rect = None
         self.screen.blit(self.table_surface, (0, 0))
         self._draw_top_bar(now)
         self._draw_center_table(now)
@@ -1160,9 +1306,18 @@ class PokerTableApp:
         self._draw_result_banner()
         self._draw_bottom_dock()
         self._draw_log_drawer()
+        self.summary_modal.draw(self.screen, self.fonts.palette, self.session)
         self.rules_modal.draw(self.screen, self.fonts.palette)
         self.setup_modal.draw(self.screen, self.fonts.palette)
         self.update_modal.draw(self.screen, self.fonts.palette, self.updater.snapshot())
+
+        vp = self._viewport_rect
+        if vp.width == WINDOW_WIDTH and vp.height == WINDOW_HEIGHT and vp.x == 0 and vp.y == 0:
+            self.display_surface.blit(self.screen, (0, 0))
+        else:
+            self.display_surface.fill((11, 16, 24))
+            scaled = pygame.transform.smoothscale(self.screen, (vp.width, vp.height))
+            self.display_surface.blit(scaled, vp.topleft)
         pygame.display.flip()
 
     def run(self):

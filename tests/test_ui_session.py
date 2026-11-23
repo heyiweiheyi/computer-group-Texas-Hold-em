@@ -203,6 +203,44 @@ class TexasHoldemSessionTests(unittest.TestCase):
         if started:
             self.assertEqual(session.game.button_index, 1 - first_button)
 
+    def test_short_incomplete_all_in_does_not_reopen_raising_for_acted_player(self):
+        # 3-player pot: Human bets $20, AI 1 all-in for $25 (+$5 < min_raise $20), AI 2 calls $25.
+        # Action returns to Human (already acted since last full bet $20): Human can Call/Fold, NOT re-raise.
+        session = TexasHoldemSession(starting_chips=200, small_blind=5, big_blind=10, num_computers=2)
+        session.street = "flop"
+        session.game.board = [session.game.deck.draw() for _ in range(3)]
+        session.game.round_bets = [0, 0, 0]
+        session.game.hand_contributions = [10, 10, 10]
+        session.game.pot = 30
+        session.game.players[0].chips = 200
+        session.game.players[1].chips = 25
+        session.game.players[2].chips = 200
+        session.min_raise = 10
+        session.last_full_bet = 0
+        session.acted_since_full_raise = set()
+        session.pending = [0, 1, 2]
+        session.phase = "waiting_human"
+
+        # Human bets $20 (min_raise becomes $20, last_full_bet = $20)
+        legal_open = session.get_legal_human_actions()
+        self.assertTrue(legal_open["is_bet"])
+        self.assertEqual(legal_open["min_total_bet"], 10)
+        session.submit_human_action({"action": "raise", "amount": 20})
+
+        with patch.object(
+            ComputerPlayer,
+            "choose_action",
+            side_effect=[{"action": "all_in"}, {"action": "call"}],
+        ):
+            session.step_computer_turn()  # AI 1 all-in for $25 (+$5 incomplete raise)
+            session.step_computer_turn()  # AI 2 calls $25
+
+        self.assertEqual(session.phase, "waiting_human")
+        legal_after = session.get_legal_human_actions()
+        self.assertEqual(legal_after["to_call"], 5)
+        self.assertFalse(legal_after["can_raise"])
+        self.assertFalse(legal_after["can_all_in"])
+
 
 class UpdaterTests(unittest.TestCase):
     def test_check_for_updates_detects_new_commit_for_zip_install(self):
@@ -256,6 +294,9 @@ class HeadlessGuiTests(unittest.TestCase):
             app.update_modal.visible = True
             app.render()
             app.update_modal.visible = False
+            app.summary_modal.visible = True
+            app.render()
+            app.summary_modal.visible = False
             app.rules_modal.visible = True
             app.show_log = True
             app.render()

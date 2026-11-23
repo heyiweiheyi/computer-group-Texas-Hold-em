@@ -708,8 +708,12 @@ class TexasHoldemGame:
             raise_size = new_current_bet - old_current_bet
             if raise_size >= min_raise:
                 min_raise = raise_size
-            logs.append(f"{player.name} raises by ${raise_size}; total bet this street: ${new_current_bet}.")
-            summary = f"RAISE +${raise_size}"
+            if old_current_bet == 0:
+                logs.append(f"{player.name} bets ${new_current_bet}.")
+                summary = f"BET ${new_current_bet}"
+            else:
+                logs.append(f"{player.name} raises to ${new_current_bet} (+${raise_size}).")
+                summary = f"RAISE ${new_current_bet}"
             if player.chips == 0:
                 logs.append(f"{player.name} is all-in.")
                 summary = f"ALL-IN ${new_current_bet}"
@@ -1048,6 +1052,10 @@ class TexasHoldemSession:
         self.active_run_index = 0
         self.run_start_board_len = 0
         self.runout_status = ""
+        self.last_full_bet = 0
+        self.acted_since_full_raise = set()
+        self.refund_logs = []
+        self.won_this_hand = {}
         self.start_new_match()
 
     def _append_log(self, message):
@@ -1127,6 +1135,10 @@ class TexasHoldemSession:
         self.active_run_index = 0
         self.run_start_board_len = 0
         self.runout_status = ""
+        self.last_full_bet = self.game.big_blind
+        self.acted_since_full_raise = set()
+        self.refund_logs = []
+        self.won_this_hand = {i: 0 for i in range(n)}
 
         self.game._deal_hole_cards()
         small_blind_index, big_blind_index = self.game._blind_positions()
@@ -1166,10 +1178,12 @@ class TexasHoldemSession:
         self.winner_index = showdown["winner_index"]
         self.win_reason = "showdown"
         self.pot_awarded = showdown["pot_awarded"]
+        self.won_this_hand = dict(showdown["total_by_player"])
         self.phase = "hand_over"
         self._update_equities(self.game.board)
 
         if showdown["refund_log"]:
+            self.refund_logs.append(showdown["refund_log"])
             self._append_log(showdown["refund_log"])
         for idx, result in enumerate(showdown["player_results"]):
             if result is not None:
@@ -1221,6 +1235,7 @@ class TexasHoldemSession:
         self.winner_index = top_players[0] if len(top_players) == 1 else None
         self.win_reason = "showdown"
         self.pot_awarded = pot_total
+        self.won_this_hand = dict(total_by_player)
         self.phase = "hand_over"
         self.showdown_result = {
             "refund_log": refund_msg,
@@ -1234,6 +1249,7 @@ class TexasHoldemSession:
         }
 
         if refund_msg:
+            self.refund_logs.append(refund_msg)
             self._append_log(refund_msg)
         for run_idx, res in enumerate((res1, res2), start=1):
             for award in res["pot_awards"]:
@@ -1257,6 +1273,8 @@ class TexasHoldemSession:
         n = len(self.game.players)
         self.game.round_bets = [0] * n
         self.min_raise = self.game.big_blind
+        self.last_full_bet = 0
+        self.acted_since_full_raise = set()
         self.last_actions = [
             "OUT" if self.game.eliminated[i] else ("FOLD" if self.game.folded[i] else "")
             for i in range(n)
@@ -1279,8 +1297,10 @@ class TexasHoldemSession:
                 winner = contenders[0]
                 refund_msg = self.game._refund_unmatched_bet(quiet=True)
                 if refund_msg:
+                    self.refund_logs.append(refund_msg)
                     self._append_log(refund_msg)
                 self.pot_awarded = self.game._award_pot(winner, quiet=True)
+                self.won_this_hand = {i: (self.pot_awarded if i == winner else 0) for i in range(len(self.game.players))}
                 self.winner_index = winner
                 self.win_reason = "fold"
                 self.phase = "hand_over"
@@ -1289,6 +1309,7 @@ class TexasHoldemSession:
             if any(self.game.players[i].chips == 0 for i in contenders):
                 refund_msg = self.game._refund_unmatched_bet(quiet=True)
                 if refund_msg:
+                    self.refund_logs.append(refund_msg)
                     self._append_log(refund_msg)
 
             can_act = [i for i in contenders if self.game.players[i].chips > 0]
@@ -1418,37 +1439,61 @@ class TexasHoldemSession:
             self.runout_status = f"{card_tag}: {card}  •  Revealing {next_tag}..."
 
     def get_legal_human_actions(self):
-        """Return legal choices and bet bounds for the human player."""
+        """Return legal choices and bet bounds for the human player (WSOP/TDA rules)."""
         human = self.game.players[0]
         contenders = self.game._contenders()
         max_bet = max((self.game.round_bets[i] for i in contenders), default=0)
-        to_call = max(0, max_bet - self.game.round_bets[0])
+        human_bet = self.game.round_bets[0]
+        to_call = max(0, max_bet - human_bet)
         others_can_act = any(i != 0 and self.game.players[i].chips > 0 for i in contenders)
-        can_raise = others_can_act and human.chips >= to_call + self.min_raise
+        reopen_allowed = 0 not in self.acted_since_full_raise
+        can_raise = (
+            reopen_allowed
+            and others_can_act
+            and human.chips >= to_call + self.min_raise
+        )
         max_raise = max(0, human.chips - to_call)
+        min_total_bet = max_bet + self.min_raise
+        max_total_bet = human_bet + human.chips
+        can_all_in = (
+            reopen_allowed
+            and others_can_act
+            and human.chips > 0
+            and (to_call == 0 or human.chips > to_call)
+        )
         return {
             "can_fold": to_call > 0,
             "can_check": to_call == 0,
             "to_call": to_call,
             "call_amount": min(to_call, human.chips),
+            "current_bet": max_bet,
+            "human_bet": human_bet,
+            "is_bet": max_bet == 0,
             "can_raise": can_raise,
             "min_raise": self.min_raise,
             "max_raise": max_raise,
-            "can_all_in": others_can_act and human.chips > 0,
+            "min_total_bet": min_total_bet,
+            "max_total_bet": max_total_bet,
+            "can_all_in": can_all_in,
             "all_in_amount": human.chips,
         }
 
     def _apply_action_and_advance(self, player_index, action):
+        old_full_bet = self.last_full_bet
+        old_min_raise = self.min_raise
         result = self.game._apply_betting_action(
             player_index, action, self.min_raise, self.pending
         )
         self.last_actions[player_index] = result["summary"]
         for line in result["logs"]:
             self._append_log(line)
+            if line.startswith("Uncalled bet of"):
+                self.refund_logs.append(line)
 
         if result["folded_winner"] is not None:
             winner = result["folded_winner"]
             self.pot_awarded = self.game._award_pot(winner, quiet=True)
+            self.won_this_hand = {i: (self.pot_awarded if i == winner else 0) for i in range(len(self.game.players))}
             self.winner_index = winner
             self.win_reason = "fold"
             self.phase = "hand_over"
@@ -1457,7 +1502,17 @@ class TexasHoldemSession:
             self._append_log(f"{winner_name} {verb} ${self.pot_awarded}!")
             return
 
-        self.min_raise = result["min_raise"]
+        contenders = self.game._contenders()
+        new_max_bet = max((self.game.round_bets[i] for i in contenders), default=0)
+        # WSOP/TDA rule: only a full raise (increment >= min_raise from last_full_bet) reopens betting
+        if new_max_bet - old_full_bet >= old_min_raise:
+            self.min_raise = max(result["min_raise"], new_max_bet - old_full_bet)
+            self.last_full_bet = new_max_bet
+            self.acted_since_full_raise = {player_index}
+        else:
+            self.min_raise = result["min_raise"]
+            self.acted_since_full_raise.add(player_index)
+
         self.pending = result["pending"]
         self._advance_state()
 
@@ -1501,7 +1556,12 @@ class TexasHoldemSession:
             i != comp_index and self.game.players[i].chips > 0 for i in contenders
         )
         opponent_all_in = not others_can_act
-        can_raise = others_can_act and computer.chips >= to_call + self.min_raise
+        reopen_allowed = comp_index not in self.acted_since_full_raise
+        can_raise = (
+            reopen_allowed
+            and others_can_act
+            and computer.chips >= to_call + self.min_raise
+        )
         action = computer.choose_action(
             to_call,
             can_raise,

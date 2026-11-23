@@ -120,6 +120,10 @@ class RaiseControl:
         self.min_amount = 10
         self.max_amount = 100
         self.value = 10
+        self.pot = 0
+        self.current_bet = 0
+        self.to_call = 0
+        self.is_bet = True
         self.enabled = False
         self.dragging = False
 
@@ -134,11 +138,17 @@ class RaiseControl:
             ("Max", ActionButton((start_x + 3 * (pill_w + gap), presets_y, pill_w, pill_h), "Max", BTN_NEUTRAL, BTN_NEUTRAL_HOVER, radius=7)),
         ]
 
-    def set_bounds(self, min_amount, max_amount, pot):
+    def set_bounds(self, min_amount, max_amount, pot, current_bet=0, to_call=0, is_bet=False, reset_to_min=False):
         self.min_amount = min_amount
         self.max_amount = max(min_amount, max_amount)
         self.pot = pot
-        self.value = max(self.min_amount, min(self.max_amount, self.value))
+        self.current_bet = current_bet
+        self.to_call = to_call
+        self.is_bet = is_bet
+        if reset_to_min:
+            self.value = self.min_amount
+        else:
+            self.value = max(self.min_amount, min(self.max_amount, self.value))
 
     def set_enabled(self, enabled):
         self.enabled = enabled
@@ -168,12 +178,15 @@ class RaiseControl:
 
         for key, btn in self.preset_buttons:
             if btn.handle_event(event):
+                pot_after_call = pot + self.to_call
                 if key == "Min":
                     self.value = self.min_amount
                 elif key == "1/2":
-                    self.value = max(self.min_amount, min(self.max_amount, pot // 2))
+                    target = self.current_bet + pot_after_call // 2
+                    self.value = max(self.min_amount, min(self.max_amount, target))
                 elif key == "Pot":
-                    self.value = max(self.min_amount, min(self.max_amount, pot))
+                    target = self.current_bet + pot_after_call
+                    self.value = max(self.min_amount, min(self.max_amount, target))
                 elif key == "Max":
                     self.value = self.max_amount
                 return
@@ -220,7 +233,12 @@ class RaiseControl:
 
         # Value label right of slider
         lbl_font = fonts.get(13, bold=True)
-        lbl_text = f"+${self.value}" if self.enabled else "Raise N/A"
+        if not self.enabled:
+            lbl_text = "Raise N/A"
+        elif self.is_bet:
+            lbl_text = f"Bet ${self.value}"
+        else:
+            lbl_text = f"To ${self.value}"
         lbl_col = GOLD_BRIGHT if self.enabled else TEXT_MUTED
         draw_text(
             surface,
@@ -644,3 +662,197 @@ class UpdateModal:
         self.check_btn.draw(surface, fonts)
         self.action_btn.draw(surface, fonts)
         self.close_btn.draw(surface, fonts)
+
+
+class HandSummaryModal:
+    """End-of-hand settlement popup clearly breaking down Main Pot, Side Pots, and Run It Twice."""
+
+    def __init__(self, window_w, window_h):
+        self.visible = False
+        self.modal_rect = pygame.Rect((window_w - 680) // 2, (window_h - 548) // 2, 680, 548)
+        self.view_btn = ActionButton(
+            (self.modal_rect.left + 28, self.modal_rect.bottom - 56, 152, 38),
+            "View Table",
+            BTN_NEUTRAL,
+            BTN_NEUTRAL_HOVER,
+            radius=8,
+        )
+        self.next_btn = ActionButton(
+            (self.modal_rect.right - 216, self.modal_rect.bottom - 56, 188, 38),
+            "Next Hand",
+            BTN_CALL,
+            BTN_CALL_HOVER,
+            shortcut="Space",
+            radius=8,
+        )
+
+    def handle_event(self, event):
+        """Return 'next', 'close', or None."""
+        if not self.visible:
+            return None
+
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                self.visible = False
+                return "close"
+            if event.key in (pygame.K_SPACE, pygame.K_RETURN):
+                self.visible = False
+                return "next"
+
+        if self.view_btn.handle_event(event):
+            self.visible = False
+            return "close"
+        if self.next_btn.handle_event(event):
+            self.visible = False
+            return "next"
+
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if not self.modal_rect.collidepoint(event.pos):
+                self.visible = False
+                return "close"
+        return None
+
+    def _build_pot_lines(self, session):
+        lines = []
+        players = session.game.players
+        if session.win_reason == "fold" and session.winner_index is not None:
+            w_name = players[session.winner_index].name
+            lines.append((f"Main Pot (${session.pot_awarded})", f"{w_name} wins (all others folded)", GOLD_BRIGHT))
+        elif session.run_count == 2 and session.run_results:
+            for run_idx, res in enumerate(session.run_results, start=1):
+                for award in res["pot_awards"]:
+                    tag = f"RUN {run_idx} • {award['pot_name']} (${award['amount']})"
+                    w_names = ", ".join(players[i].name for i in award["winners"])
+                    first_w = award["winners"][0]
+                    hand_name = res["player_results"][first_w]["hand_name"]
+                    if len(award["winners"]) == 1:
+                        detail = f"{w_names} wins ${award['amount']}  ({hand_name})"
+                    else:
+                        detail = f"{w_names} split (${award['share']} ea • {hand_name})"
+                    col = GOLD_BRIGHT if 0 in award["winners"] else TEXT_PRIMARY
+                    lines.append((tag, detail, col))
+        elif session.showdown_result:
+            for award in session.showdown_result.get("pot_awards", []):
+                tag = f"{award['pot_name']} (${award['amount']})"
+                w_names = ", ".join(players[i].name for i in award["winners"])
+                first_w = award["winners"][0]
+                hand_name = session.showdown_result["player_results"][first_w]["hand_name"]
+                if len(award["winners"]) == 1:
+                    detail = f"{w_names} wins ${award['amount']}  ({hand_name})"
+                else:
+                    detail = f"{w_names} split (${award['share']} ea • {hand_name})"
+                col = GOLD_BRIGHT if 0 in award["winners"] else TEXT_PRIMARY
+                lines.append((tag, detail, col))
+
+        for msg in session.refund_logs:
+            lines.append(("Uncalled Return", msg.replace("Uncalled bet of ", ""), (132, 212, 250)))
+        return lines
+
+    def draw(self, surface, fonts, session):
+        if not self.visible:
+            return
+
+        dim = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
+        dim.fill((6, 10, 16, 175))
+        surface.blit(dim, (0, 0))
+
+        pygame.draw.rect(surface, PANEL_BG, self.modal_rect, border_radius=16)
+        pygame.draw.rect(surface, GOLD_MID, self.modal_rect, width=1, border_radius=16)
+
+        left = self.modal_rect.left + 26
+        right = self.modal_rect.right - 26
+
+        # Header
+        if session.run_count == 2 and session.win_reason == "showdown":
+            sub = f"Run It Twice Settlement  •  Total Awarded: ${session.pot_awarded}"
+        elif session.win_reason == "fold":
+            sub = f"Won by Fold  •  Pot: ${session.pot_awarded}"
+        else:
+            sub = f"Showdown Settlement  •  Total Awarded: ${session.pot_awarded}"
+
+        draw_text(
+            surface,
+            fonts.get(20, bold=True),
+            f"Hand #{session.hand_number} Summary",
+            GOLD_BRIGHT,
+            (left, self.modal_rect.top + 20),
+        )
+        draw_text(
+            surface,
+            fonts.get(12, bold=False),
+            sub,
+            TEXT_SECONDARY,
+            (left, self.modal_rect.top + 47),
+        )
+
+        # Pot breakdown section
+        draw_text(
+            surface,
+            fonts.get(13, bold=True),
+            "Pot Breakdown (Main Pot & Side Pots)",
+            TEXT_PRIMARY,
+            (left, self.modal_rect.top + 74),
+        )
+        pot_lines = self._build_pot_lines(session)[:8]
+        box_h = max(62, len(pot_lines) * 22 + 14)
+        pot_box = pygame.Rect(left, self.modal_rect.top + 94, right - left, box_h)
+        pygame.draw.rect(surface, PANEL_BG_ALT, pot_box, border_radius=10)
+        pygame.draw.rect(surface, PANEL_BORDER, pot_box, width=1, border_radius=10)
+
+        py = pot_box.top + 8
+        tag_font = fonts.get(12, bold=True)
+        det_font = fonts.get(12, bold=False)
+        for tag, detail, col in pot_lines:
+            draw_text(surface, tag_font, tag, GOLD_BRIGHT, (pot_box.left + 12, py))
+            draw_text(surface, det_font, detail, col, (pot_box.left + 224, py))
+            py += 22
+
+        # Player stack & hand table
+        sec_y = pot_box.bottom + 12
+        draw_text(
+            surface,
+            fonts.get(13, bold=True),
+            "Player Results & Remaining Chips",
+            TEXT_PRIMARY,
+            (left, sec_y),
+        )
+
+        table_y = sec_y + 20
+        row_h = 25
+        players = session.game.players
+        active_indices = [i for i in range(len(players)) if not session.game.eliminated[i]]
+        for idx_pos, p_idx in enumerate(active_indices):
+            if table_y + (idx_pos + 1) * row_h > self.modal_rect.bottom - 66:
+                break
+            r_rect = pygame.Rect(left, table_y + idx_pos * row_h, right - left, row_h - 3)
+            bg = PANEL_BG_ALT if idx_pos % 2 == 0 else (21, 29, 42)
+            pygame.draw.rect(surface, bg, r_rect, border_radius=6)
+
+            player = players[p_idx]
+            won = session.won_this_hand.get(p_idx, 0)
+            if session.game.folded[p_idx]:
+                hand_desc = "Folded"
+            elif session.showdown_result and session.showdown_result["player_results"][p_idx]:
+                if session.run_count == 2 and len(session.run_results) == 2:
+                    h1 = session.run_results[0]["player_results"].get(p_idx, {}).get("hand_name", "-")
+                    h2 = session.run_results[1]["player_results"].get(p_idx, {}).get("hand_name", "-")
+                    hand_desc = f"R1: {h1}  /  R2: {h2}"
+                else:
+                    hand_desc = session.showdown_result["player_results"][p_idx]["hand_name"]
+            else:
+                hand_desc = "Winner" if p_idx == session.winner_index else "In hand"
+
+            name_col = GOLD_BRIGHT if p_idx == 0 else TEXT_PRIMARY
+            draw_text(surface, fonts.get(12, bold=True), player.name, name_col, (r_rect.left + 10, r_rect.centery), anchor="midleft")
+            draw_text(surface, fonts.get(11, bold=False), hand_desc, TEXT_SECONDARY, (r_rect.left + 112, r_rect.centery), anchor="midleft")
+
+            won_text = f"+${won}" if won > 0 else "—"
+            won_col = (72, 206, 146) if won > 0 else TEXT_MUTED
+            draw_text(surface, fonts.get(12, bold=True), won_text, won_col, (r_rect.right - 120, r_rect.centery), anchor="midright")
+            draw_text(surface, fonts.get(12, bold=True), f"Stack: ${player.chips}", GOLD_BRIGHT if player.chips > 0 else TEXT_MUTED, (r_rect.right - 10, r_rect.centery), anchor="midright")
+
+        human_alive = players[0].chips > 0
+        any_ai_alive = any(p.chips > 0 for p in players[1:])
+        self.next_btn.label = "Next Hand" if (human_alive and any_ai_alive) else "Finish Match"
+        self.view_btn.draw(surface, fonts)
+        self.next_btn.draw(surface, fonts)
