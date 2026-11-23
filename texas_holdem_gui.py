@@ -1,6 +1,8 @@
 """Pygame graphical interface for 2-to-6 player Texas Hold'em with All-In Runouts."""
 
+import os
 import random
+import subprocess
 import sys
 import time
 
@@ -54,7 +56,8 @@ from ui_theme import (
     ease_out_cubic,
     lerp,
 )
-from ui_widgets import ActionButton, RaiseControl, RulesModal, SetupModal
+from ui_updater import UpdateController
+from ui_widgets import ActionButton, RaiseControl, RulesModal, SetupModal, UpdateModal
 
 
 DECK_POS = (924, 290)
@@ -117,10 +120,8 @@ class FontManagerWrapper:
 class PokerTableApp:
     """Main Pygame application driving TexasHoldemSession at 60 FPS."""
 
-    def __init__(self, headless=False, num_computers=1):
+    def __init__(self, headless=False, num_computers=1, check_updates=None):
         if headless:
-            import os
-
             os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
         pygame.init()
@@ -130,6 +131,7 @@ class PokerTableApp:
             self._ensure_window_visible_windows()
         self.clock = pygame.time.Clock()
 
+        self.app_dir = os.path.dirname(os.path.abspath(__file__))
         self.fonts = FontManagerWrapper()
         self.table_surface = build_table_surface(WINDOW_WIDTH, WINDOW_HEIGHT, self.fonts.palette)
         self.card_renderer = CardRenderer(self.fonts.palette)
@@ -144,12 +146,17 @@ class PokerTableApp:
         )
         self.rules_modal = RulesModal(WINDOW_WIDTH, WINDOW_HEIGHT)
         self.setup_modal = SetupModal(WINDOW_WIDTH, WINDOW_HEIGHT, max_computers=MAX_COMPUTERS)
+        self.update_modal = UpdateModal(WINDOW_WIDTH, WINDOW_HEIGHT)
+        self.updater = UpdateController(self.app_dir)
+        self.update_toast_dismissed = False
+        self._restart_requested = False
         self.show_log = False
 
         self.display_chips = [float(p.chips) for p in self.session.game.players]
         self.display_pot = float(self.session.game.pot)
         self.card_anims = {}
         self.prev_board_len = 0
+        self.prev_run_lens = [0, 0]
         self.prev_pot = self.session.game.pot
         self.prev_phase = self.session.phase
         self.ai_wait_until = 0.0
@@ -158,6 +165,10 @@ class PokerTableApp:
         self._build_controls()
         self._trigger_new_hand_anims()
         self._sync_timers_and_controls()
+
+        should_check = (not headless) if check_updates is None else bool(check_updates)
+        if should_check:
+            self.updater.check_async()
 
     @staticmethod
     def _ensure_window_visible_windows():
@@ -173,6 +184,7 @@ class PokerTableApp:
 
     def _build_controls(self):
         # Top utility bar buttons
+        self.btn_update = ActionButton((588, 9, 98, 30), "Update", BTN_NEUTRAL, BTN_NEUTRAL_HOVER, radius=8)
         self.btn_setup = ActionButton((694, 9, 128, 30), "Table: 1 AI", BTN_RAISE, BTN_RAISE_HOVER, radius=8)
         self.btn_log = ActionButton((830, 9, 72, 30), "Log", BTN_NEUTRAL, BTN_NEUTRAL_HOVER, radius=8)
         self.btn_sound = ActionButton((910, 9, 96, 30), "Sound: On", BTN_NEUTRAL, BTN_NEUTRAL_HOVER, radius=8)
@@ -198,6 +210,7 @@ class PokerTableApp:
         now = time.monotonic()
         origin = self._deck_origin()
         self.prev_board_len = len(self.session.game.board)
+        self.prev_run_lens = [0, 0]
         self.display_chips = [float(p.chips) for p in self.session.game.players]
         self.card_anims = {}
         step = 0
@@ -213,8 +226,25 @@ class PokerTableApp:
         origin = self._deck_origin()
         for idx in range(old_len, new_len):
             delay = (idx - old_len) * 0.09
-            self.card_anims[("board", idx)] = (now + delay, 0.32, origin)
+            self.card_anims[("board", idx)] = (now + delay, 0.36, origin)
         self.sounds.play("card")
+
+    def _next_runout_delay(self):
+        """Return suspenseful delay before flipping the next all-in runout card."""
+        if self.session.run_count == 2 and len(self.session.run_boards) == 2:
+            r1_len = len(self.session.run_boards[0])
+            r2_len = len(self.session.run_boards[1])
+            if r1_len == 5 and r2_len == self.session.run_start_board_len:
+                return 2.2
+            cur_len = r1_len if r1_len < 5 else r2_len
+        else:
+            cur_len = len(self.session.game.board)
+
+        if cur_len == 4:
+            return 2.1
+        if cur_len == 3:
+            return 1.65
+        return 1.25
 
     def _sync_timers_and_controls(self):
         now = time.monotonic()
@@ -228,7 +258,7 @@ class PokerTableApp:
             self.ai_wait_until = 0.0
 
         if self.session.phase == "reveal_board" and self.runout_wait_until <= 0.0:
-            self.runout_wait_until = now + 1.15
+            self.runout_wait_until = now + self._next_runout_delay()
         elif self.session.phase != "reveal_board":
             self.runout_wait_until = 0.0
 
@@ -272,10 +302,24 @@ class PokerTableApp:
             self.btn_next.label = "Next Hand"
 
     def _on_state_advanced(self, previous_phase):
-        new_board_len = len(self.session.game.board)
-        if new_board_len > self.prev_board_len:
-            self._trigger_board_anims(self.prev_board_len, new_board_len)
-            self.prev_board_len = new_board_len
+        if self.session.run_count == 2 and len(self.session.run_boards) == 2:
+            now = time.monotonic()
+            origin = self._deck_origin()
+            dealt_any = False
+            for run_idx in range(2):
+                new_len = len(self.session.run_boards[run_idx])
+                if new_len > self.prev_run_lens[run_idx]:
+                    for c_idx in range(self.prev_run_lens[run_idx], new_len):
+                        self.card_anims[("run", run_idx, c_idx)] = (now, 0.36, origin)
+                    self.prev_run_lens[run_idx] = new_len
+                    dealt_any = True
+            if dealt_any:
+                self.sounds.play("card")
+        else:
+            new_board_len = len(self.session.game.board)
+            if new_board_len > self.prev_board_len:
+                self._trigger_board_anims(self.prev_board_len, new_board_len)
+                self.prev_board_len = new_board_len
 
         if self.session.game.pot > self.prev_pot:
             self.sounds.play("chip")
@@ -303,6 +347,8 @@ class PokerTableApp:
             return
         prev_phase = self.session.phase
         self.session.choose_run_count(count)
+        if count == 2 and len(self.session.run_boards) == 2:
+            self.prev_run_lens = [len(self.session.run_boards[0]), len(self.session.run_boards[1])]
         self._on_state_advanced(prev_phase)
 
     def _advance_next_hand_or_match(self):
@@ -318,6 +364,16 @@ class PokerTableApp:
             self._sync_timers_and_controls()
 
     def handle_event(self, event):
+        if self.update_modal.visible:
+            upd_action = self.update_modal.handle_event(event, self.updater.snapshot())
+            if upd_action == "check":
+                self.updater.check_async()
+            elif upd_action == "update":
+                self.updater.update_async()
+            elif upd_action == "restart":
+                self._restart_requested = True
+            return
+
         if self.setup_modal.visible:
             new_cfg = self.setup_modal.handle_event(event)
             if new_cfg is not None:
@@ -370,6 +426,12 @@ class PokerTableApp:
                     self._advance_next_hand_or_match()
                     return
 
+        if self.btn_update.handle_event(event):
+            self.update_toast_dismissed = True
+            self.update_modal.visible = True
+            if self.updater.snapshot()["status"] == "idle":
+                self.updater.check_async()
+            return
         if self.btn_setup.handle_event(event):
             self.setup_modal.open_with(
                 self.session.num_computers,
@@ -491,7 +553,7 @@ class PokerTableApp:
             return ("BB", (58, 74, 102), TEXT_PRIMARY)
         return None
 
-    def _draw_top_bar(self):
+    def _draw_top_bar(self, now):
         bar_rect = pygame.Rect(0, 0, WINDOW_WIDTH, 48)
         pygame.draw.rect(self.screen, PANEL_BG, bar_rect)
         pygame.draw.line(self.screen, PANEL_BORDER, (0, 48), (WINDOW_WIDTH, 48), 1)
@@ -502,8 +564,55 @@ class PokerTableApp:
         meta = f"Hand #{self.session.hand_number}  •  Blinds ${self.session.small_blind}/${self.session.big_blind}  •  {n_players}P Table"
         draw_text(self.screen, self.fonts.get(13, bold=False), meta, TEXT_SECONDARY, (194, 24), anchor="midleft")
 
-        for btn in (self.btn_setup, self.btn_log, self.btn_sound, self.btn_rules, self.btn_new_match):
+        upd = self.updater.snapshot()
+        notify = upd["has_update"] or upd["restart_required"]
+        if upd["restart_required"]:
+            self.btn_update.label = "Restart!"
+            self.btn_update.bg_color = BTN_CALL
+            self.btn_update.hover_color = BTN_CALL_HOVER
+        elif upd["has_update"]:
+            self.btn_update.label = "Update !"
+            self.btn_update.bg_color = BTN_CALL
+            self.btn_update.hover_color = BTN_CALL_HOVER
+        elif upd["status"] == "updating":
+            self.btn_update.label = "Updating"
+            self.btn_update.bg_color = BTN_RAISE
+            self.btn_update.hover_color = BTN_RAISE_HOVER
+        elif upd["status"] == "checking":
+            self.btn_update.label = "Checking"
+            self.btn_update.bg_color = BTN_NEUTRAL
+            self.btn_update.hover_color = BTN_NEUTRAL_HOVER
+        else:
+            self.btn_update.label = "Update"
+            self.btn_update.bg_color = BTN_NEUTRAL
+            self.btn_update.hover_color = BTN_NEUTRAL_HOVER
+
+        for btn in (self.btn_update, self.btn_setup, self.btn_log, self.btn_sound, self.btn_rules, self.btn_new_match):
             btn.draw(self.screen, self.fonts.palette)
+
+        # Pulsing red notification dot on Update button when GitHub has a new commit
+        if notify:
+            dot_center = (self.btn_update.rect.right - 3, self.btn_update.rect.top + 3)
+            pulse = 0.5 + 0.5 * abs((now * 2.8) % 2.0 - 1.0)
+            outer_r = int(7 + pulse * 3)
+            halo = pygame.Surface((26, 26), pygame.SRCALPHA)
+            pygame.draw.circle(halo, (238, 68, 68, int(90 * (1.0 - 0.4 * pulse))), (13, 13), outer_r)
+            self.screen.blit(halo, (dot_center[0] - 13, dot_center[1] - 13))
+            pygame.draw.circle(self.screen, (238, 68, 68), dot_center, 6)
+            pygame.draw.circle(self.screen, TEXT_PRIMARY, dot_center, 6, width=1)
+
+        if upd["has_update"] and not self.update_toast_dismissed and not self.update_modal.visible:
+            toast = pygame.Rect(18, 54, 346, 24)
+            pygame.draw.rect(self.screen, (16, 42, 34), toast, border_radius=12)
+            pygame.draw.rect(self.screen, GOLD_BRIGHT, toast, width=1, border_radius=12)
+            draw_text(
+                self.screen,
+                self.fonts.get(11, bold=True),
+                f"New update ({upd['short_sha']}) on GitHub! Click 'Update !'",
+                GOLD_BRIGHT,
+                toast.center,
+                anchor="center",
+            )
 
     def _draw_equity_pill(self, x, y, width, player_index):
         if player_index not in self.session.equities:
@@ -784,7 +893,7 @@ class PokerTableApp:
 
         # Dual-board Run It Twice display OR single-board display
         if self.session.run_count == 2 and self.session.run_boards:
-            self._draw_dual_boards()
+            self._draw_dual_boards(now)
         else:
             winning_set = self._winning_cards_single()
             is_showdown = self.session.win_reason == "showdown"
@@ -804,23 +913,25 @@ class PokerTableApp:
                     dimmed=(is_showdown and bool(winning_set) and not in_best),
                 )
 
-    def _draw_dual_boards(self):
+    def _draw_dual_boards(self, now):
         arena = pygame.Rect(344, 248, 512, 208)
         pygame.draw.rect(self.screen, (10, 36, 26), arena, border_radius=14)
         pygame.draw.rect(self.screen, GOLD_DIM, arena, width=1, border_radius=14)
 
         is_showdown = self.session.win_reason == "showdown"
+        is_revealing = self.session.phase == "reveal_board"
         row_ys = [256, 356]
         for run_idx in range(2):
             ry = row_ys[run_idx]
+            is_active_run = is_revealing and self.session.active_run_index == run_idx
             label_rect = pygame.Rect(354, ry + 32, 66, 28)
-            pygame.draw.rect(self.screen, PANEL_BG, label_rect, border_radius=8)
-            pygame.draw.rect(self.screen, GOLD_MID, label_rect, width=1, border_radius=8)
+            pygame.draw.rect(self.screen, GOLD_BRIGHT if is_active_run else PANEL_BG, label_rect, border_radius=8)
+            pygame.draw.rect(self.screen, GOLD_BRIGHT if is_active_run else GOLD_MID, label_rect, width=1, border_radius=8)
             draw_text(
                 self.screen,
                 self.fonts.get(12, bold=True),
                 f"RUN {run_idx + 1}",
-                GOLD_BRIGHT,
+                (20, 16, 8) if is_active_run else GOLD_BRIGHT,
                 label_rect.center,
                 anchor="center",
             )
@@ -835,20 +946,30 @@ class PokerTableApp:
                 if c_idx < len(board):
                     card = board[c_idx]
                     in_best = card in win_set
+                    target_pos = (cx, ry - (4 if (is_showdown and in_best) else 0))
+                    pos = self._animated_pos(("run", run_idx, c_idx), target_pos, now)
                     self.card_renderer.draw_card(
                         self.screen,
                         card,
-                        (cx, ry - (4 if (is_showdown and in_best) else 0)),
+                        pos,
                         face_up=True,
                         card_size=(DUAL_CARD_WIDTH, DUAL_CARD_HEIGHT),
                         highlighted=(is_showdown and in_best),
                         dimmed=(is_showdown and bool(win_set) and not in_best),
                     )
                 else:
+                    slot_border = GOLD_MID if (is_active_run and c_idx == len(board)) else (18, 62, 46)
                     pygame.draw.rect(
                         self.screen,
                         (7, 28, 20),
                         pygame.Rect(cx, ry, DUAL_CARD_WIDTH, DUAL_CARD_HEIGHT),
+                        border_radius=7,
+                    )
+                    pygame.draw.rect(
+                        self.screen,
+                        slot_border,
+                        pygame.Rect(cx, ry, DUAL_CARD_WIDTH, DUAL_CARD_HEIGHT),
+                        width=1,
                         border_radius=7,
                     )
 
@@ -913,6 +1034,20 @@ class PokerTableApp:
         self.btn_run_twice.draw(self.screen, self.fonts.palette)
 
     def _draw_result_banner(self):
+        if self.session.phase == "reveal_board" and self.session.runout_status:
+            banner = pygame.Rect(618, 598, 550, 32) if self.session.run_count == 2 else pygame.Rect(336, 418, 528, 34)
+            pygame.draw.rect(self.screen, (14, 20, 30), banner, border_radius=16)
+            pygame.draw.rect(self.screen, GOLD_MID, banner, width=1, border_radius=16)
+            draw_text(
+                self.screen,
+                self.fonts.get(13, bold=True),
+                self.session.runout_status,
+                GOLD_BRIGHT,
+                banner.center,
+                anchor="center",
+            )
+            return
+
         if self.session.phase not in ("hand_over", "match_over"):
             return
 
@@ -975,7 +1110,10 @@ class PokerTableApp:
             hint = "All-in! Choose Run Once [1] or Run Twice [2]"
             hint_col = GOLD_BRIGHT
         elif self.session.phase == "reveal_board":
-            hint = "All-in runout in progress..."
+            if self.session.run_count == 2:
+                hint = f"All-in runout — RUN {self.session.active_run_index + 1} dealing..."
+            else:
+                hint = "All-in runout — Dealing card..."
             hint_col = GOLD_BRIGHT
         elif self.session.phase == "hand_over":
             hint = "Hand finished — Click Next Hand"
@@ -1015,7 +1153,7 @@ class PokerTableApp:
     def render(self):
         now = time.monotonic()
         self.screen.blit(self.table_surface, (0, 0))
-        self._draw_top_bar()
+        self._draw_top_bar(now)
         self._draw_center_table(now)
         self._draw_players_and_cards(now)
         self._draw_runout_choice_overlay()
@@ -1024,6 +1162,7 @@ class PokerTableApp:
         self._draw_log_drawer()
         self.rules_modal.draw(self.screen, self.fonts.palette)
         self.setup_modal.draw(self.screen, self.fonts.palette)
+        self.update_modal.draw(self.screen, self.fonts.palette, self.updater.snapshot())
         pygame.display.flip()
 
     def run(self):
@@ -1035,9 +1174,14 @@ class PokerTableApp:
                     running = False
                     break
                 self.handle_event(event)
+            if self._restart_requested:
+                running = False
+                break
             self.update(dt)
             self.render()
         pygame.quit()
+        if self._restart_requested:
+            subprocess.Popen([sys.executable, os.path.abspath(__file__)], cwd=self.app_dir)
 
 
 def main():

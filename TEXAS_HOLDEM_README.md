@@ -17,7 +17,8 @@ py -3 texas_holdem_gui.py
 
 UI features & shortcuts:
 - **Multi-AI Ring Table (1–5 AI, up to 6 players):** Click `Table: N AI` in the top bar to set the number of computer opponents (capped at 5 AI), starting chips, and blinds, with automatic `D`/`SB`/`BB` rotation, player elimination, and main/side-pot settlement
-- **All-In Runout ("跑马"):** Automatic hole-card reveal, live win-equity percentages (`WIN %`) updated at every street, and choice between **Run Once (`[1]`)** and **Run It Twice (`[2]`)** dual-board split
+- **All-In Runout ("跑马"):** Automatic hole-card reveal, card-by-card suspenseful dealing (in Run It Twice, Run 1 deals out completely before Run 2 starts), live win-equity percentages (`WIN %`) updated on every card, and choice between **Run Once (`[1]`)** and **Run It Twice (`[2]`)**
+- **Built-in One-Click Updater:** Automatically checks GitHub `main` on startup; when a new commit is available, the top-bar `Update !` button displays a red notification dot and lets both Git and ZIP users pull the latest version and restart in one click
 - Interactive action buttons (`Fold [F]`, `Check / Call [C]`, `Raise [R]`, `All-In [A]`, `Next Hand [Space]`)
 - Raise slider with `Min`, `1/2 Pot`, `Pot`, and `Max` presets
 - Smooth card dealing animations, winning 5-card showdown highlights, live best-hand indicator, toggleable action log (`[L]`), hand rankings guide (`[H]`), and synthesized sound effects (`[M]` to mute)

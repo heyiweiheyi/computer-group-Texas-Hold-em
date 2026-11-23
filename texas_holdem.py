@@ -1045,6 +1045,9 @@ class TexasHoldemSession:
         self.run_count = 1
         self.run_boards = []
         self.run_results = []
+        self.active_run_index = 0
+        self.run_start_board_len = 0
+        self.runout_status = ""
         self.start_new_match()
 
     def _append_log(self, message):
@@ -1121,6 +1124,9 @@ class TexasHoldemSession:
         self.run_count = 1
         self.run_boards = []
         self.run_results = []
+        self.active_run_index = 0
+        self.run_start_board_len = 0
+        self.runout_status = ""
 
         self.game._deal_hole_cards()
         small_blind_index, big_blind_index = self.game._blind_positions()
@@ -1310,24 +1316,58 @@ class TexasHoldemSession:
             raise ValueError("Run count must be 1 or 2.")
 
         self.run_count = count
+        self.active_run_index = 0
+        self.run_start_board_len = len(self.game.board)
         if count == 2:
             self.run_boards = [list(self.game.board), list(self.game.board)]
-            self._append_log("All-in runout: Running It Twice (2x)!")
+            self.runout_status = "RUN 1 starting — dealing one card at a time..."
+            self._append_log("All-in runout: Running It Twice (Run 1, then Run 2)!")
         else:
             self.run_boards = []
+            self.runout_status = "All-in runout — dealing one card at a time..."
             self._append_log("All-in runout: Running Once (1x).")
 
         self.phase = "reveal_board"
         self._update_equities(self.game.board)
 
-    def _deal_cards_into_board(self, target_board, count):
-        if self.game.deck.cards:
+    def _deal_single_runout_card(self, target_board):
+        """Burn before Flop/Turn/River when appropriate and deal 1 card into target_board."""
+        current_len = len(target_board)
+        if current_len in (0, 3, 4) and len(self.game.deck.cards) > 1:
             self.game.deck.burn()
-        for _ in range(count):
-            target_board.append(self.game.deck.draw())
+        card = self.game.deck.draw()
+        target_board.append(card)
+        new_len = len(target_board)
+        if new_len <= 3:
+            self.street = "flop"
+            card_tag = f"Flop {new_len}/3"
+        elif new_len == 4:
+            self.street = "turn"
+            card_tag = "Turn"
+        else:
+            self.street = "river"
+            card_tag = "River"
+        return card, new_len, card_tag
+
+    def _preview_board_winner_text(self, full_board):
+        """Return a short summary of who wins a completed 5-card board."""
+        contenders = self.game._contenders()
+        best_score = None
+        winners = []
+        best_name = ""
+        for idx in contenders:
+            score, _ = evaluate_best_hand(self.game.players[idx].hole_cards + full_board)
+            if best_score is None or score > best_score:
+                best_score = score
+                winners = [idx]
+                best_name = HAND_NAMES[score[0]]
+            elif score == best_score:
+                winners.append(idx)
+        names = ", ".join(self.game.players[i].name for i in winners)
+        return f"{names} ({best_name})"
 
     def step_reveal_board(self):
-        """Deal one remaining community street during an all-in runout."""
+        """Deal one card at a time during an all-in runout (Run 1 completely, then Run 2)."""
         if self.phase == "choose_run_count":
             self.choose_run_count(1)
             return
@@ -1336,46 +1376,46 @@ class TexasHoldemSession:
             return
 
         if self.run_count == 2:
-            current_len = len(self.run_boards[0])
-            if current_len == 0:
-                self._deal_cards_into_board(self.run_boards[0], 3)
-                self._deal_cards_into_board(self.run_boards[1], 3)
-                self.street = "flop"
-                self._append_log("Run 1 Flop: " + " ".join(str(c) for c in self.run_boards[0]))
-                self._append_log("Run 2 Flop: " + " ".join(str(c) for c in self.run_boards[1]))
-            elif current_len == 3:
-                self._deal_cards_into_board(self.run_boards[0], 1)
-                self._deal_cards_into_board(self.run_boards[1], 1)
-                self.street = "turn"
-                self._append_log(f"Run 1 Turn: {self.run_boards[0][-1]}  |  Run 2 Turn: {self.run_boards[1][-1]}")
-            elif current_len == 4:
-                self._deal_cards_into_board(self.run_boards[0], 1)
-                self._deal_cards_into_board(self.run_boards[1], 1)
-                self.street = "river"
-                self._append_log(f"Run 1 River: {self.run_boards[0][-1]}  |  Run 2 River: {self.run_boards[1][-1]}")
+            if len(self.run_boards[0]) < 5:
+                self.active_run_index = 0
+                card, new_len, card_tag = self._deal_single_runout_card(self.run_boards[0])
+                self._append_log(f"Run 1 {card_tag}: {card}")
+                self.game.board = list(self.run_boards[0])
+                self._update_equities(self.run_boards[0])
+                if new_len == 5:
+                    winner_text = self._preview_board_winner_text(self.run_boards[0])
+                    self.runout_status = f"RUN 1: {winner_text}  •  Starting RUN 2..."
+                else:
+                    next_tag = "River" if new_len == 4 else ("Turn" if new_len == 3 else f"Flop {new_len + 1}/3")
+                    self.runout_status = f"RUN 1 ({card_tag}: {card})  •  Next: {next_tag}..."
+                return
 
-            self.game.board = list(self.run_boards[0])
-            self._update_equities(self.run_boards[0])
-            if len(self.run_boards[0]) == 5:
-                self._complete_showdown()
+            if len(self.run_boards[1]) < 5:
+                self.active_run_index = 1
+                card, new_len, card_tag = self._deal_single_runout_card(self.run_boards[1])
+                self._append_log(f"Run 2 {card_tag}: {card}")
+                self.game.board = list(self.run_boards[1])
+                self._update_equities(self.run_boards[1])
+                if new_len == 5:
+                    self.runout_status = ""
+                    self._complete_showdown()
+                else:
+                    next_tag = "River" if new_len == 4 else ("Turn" if new_len == 3 else f"Flop {new_len + 1}/3")
+                    self.runout_status = f"RUN 2 ({card_tag}: {card})  •  Next: {next_tag}..."
+                return
+
+            self._complete_showdown()
             return
 
-        if len(self.game.board) == 0:
-            self.game._deal_flop(quiet=True)
-            self.street = "flop"
-            self._append_log("Flop: " + " ".join(str(card) for card in self.game.board))
-        elif len(self.game.board) == 3:
-            self.game._deal_turn_or_river("Turn", quiet=True)
-            self.street = "turn"
-            self._append_log(f"Turn: {self.game.board[-1]}")
-        elif len(self.game.board) == 4:
-            self.game._deal_turn_or_river("River", quiet=True)
-            self.street = "river"
-            self._append_log(f"River: {self.game.board[-1]}")
-
+        card, new_len, card_tag = self._deal_single_runout_card(self.game.board)
+        self._append_log(f"{card_tag}: {card}")
         self._update_equities(self.game.board)
-        if len(self.game.board) == 5:
+        if new_len == 5:
+            self.runout_status = ""
             self._complete_showdown()
+        else:
+            next_tag = "River" if new_len == 4 else ("Turn" if new_len == 3 else f"Flop {new_len + 1}/3")
+            self.runout_status = f"{card_tag}: {card}  •  Revealing {next_tag}..."
 
     def get_legal_human_actions(self):
         """Return legal choices and bet bounds for the human player."""

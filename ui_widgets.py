@@ -500,3 +500,147 @@ class SetupModal:
 
         self.cancel_btn.draw(surface, fonts)
         self.start_btn.draw(surface, fonts)
+
+
+class UpdateModal:
+    """Modal dialog showing GitHub update status with one-click Pull/Download & Restart."""
+
+    def __init__(self, window_w, window_h):
+        self.visible = False
+        self.modal_rect = pygame.Rect((window_w - 540) // 2, (window_h - 300) // 2, 540, 300)
+        self.check_btn = ActionButton(
+            (self.modal_rect.left + 26, self.modal_rect.bottom - 56, 134, 38),
+            "Check Again",
+            BTN_NEUTRAL,
+            BTN_NEUTRAL_HOVER,
+            radius=8,
+        )
+        self.action_btn = ActionButton(
+            (self.modal_rect.left + 174, self.modal_rect.bottom - 56, 198, 38),
+            "Update Now",
+            BTN_CALL,
+            BTN_CALL_HOVER,
+            radius=8,
+        )
+        self.close_btn = ActionButton(
+            (self.modal_rect.right - 126, self.modal_rect.bottom - 56, 100, 38),
+            "Close",
+            BTN_NEUTRAL,
+            BTN_NEUTRAL_HOVER,
+            radius=8,
+        )
+
+    def handle_event(self, event, state):
+        """Return 'check', 'update', 'restart', or None."""
+        if not self.visible:
+            return None
+
+        busy = state["status"] in ("checking", "updating")
+        self.check_btn.enabled = not busy
+        if state["restart_required"]:
+            self.action_btn.label = "Restart Now"
+            self.action_btn.enabled = True
+        else:
+            self.action_btn.label = "Updating..." if state["status"] == "updating" else "Update Now"
+            self.action_btn.enabled = not busy
+
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            self.visible = False
+            return None
+
+        if self.check_btn.handle_event(event):
+            return "check"
+        if self.action_btn.handle_event(event):
+            return "restart" if state["restart_required"] else "update"
+        if self.close_btn.handle_event(event):
+            self.visible = False
+            return None
+
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if not self.modal_rect.collidepoint(event.pos):
+                self.visible = False
+        return None
+
+    def draw(self, surface, fonts, state):
+        if not self.visible:
+            return
+
+        dim = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
+        dim.fill((6, 10, 16, 185))
+        surface.blit(dim, (0, 0))
+
+        pygame.draw.rect(surface, PANEL_BG, self.modal_rect, border_radius=16)
+        border_col = GOLD_BRIGHT if state["has_update"] else GOLD_MID
+        pygame.draw.rect(surface, border_col, self.modal_rect, width=1, border_radius=16)
+
+        left = self.modal_rect.left + 26
+        draw_text(
+            surface,
+            fonts.get(20, bold=True),
+            "Repository Update",
+            GOLD_BRIGHT,
+            (left, self.modal_rect.top + 22),
+        )
+        draw_text(
+            surface,
+            fonts.get(12, bold=False),
+            "GitHub: heyiweiheyi/computer-group-Texas-Hold-em (main)",
+            TEXT_SECONDARY,
+            (left, self.modal_rect.top + 50),
+        )
+
+        # Info box
+        info_rect = pygame.Rect(left, self.modal_rect.top + 82, self.modal_rect.width - 52, 136)
+        pygame.draw.rect(surface, PANEL_BG_ALT, info_rect, border_radius=10)
+        pygame.draw.rect(surface, PANEL_BORDER, info_rect, width=1, border_radius=10)
+
+        status = state["status"]
+        status_map = {
+            "idle": ("IDLE", TEXT_SECONDARY),
+            "checking": ("CHECKING...", GOLD_BRIGHT),
+            "up_to_date": ("UP TO DATE", (72, 206, 146)),
+            "update_available": ("NEW UPDATE AVAILABLE!", GOLD_BRIGHT),
+            "updating": ("DOWNLOADING UPDATE...", GOLD_BRIGHT),
+            "updated": ("UPDATE INSTALLED!", (72, 206, 146)),
+            "error": ("UPDATE CHECK / PULL ISSUE", (242, 126, 126)),
+        }
+        badge_text, badge_col = status_map.get(status, (status.upper(), TEXT_PRIMARY))
+        draw_text(surface, fonts.get(14, bold=True), badge_text, badge_col, (info_rect.left + 16, info_rect.top + 14))
+
+        local_short = state["local_sha"][:7] if state["local_sha"] else "ZIP copy"
+        remote_short = state["short_sha"] or "—"
+        draw_text(
+            surface,
+            fonts.get(13, bold=False),
+            f"Local version:  {local_short}       Latest on GitHub:  {remote_short}",
+            TEXT_PRIMARY,
+            (info_rect.left + 16, info_rect.top + 44),
+        )
+
+        detail = state["detail"] or ""
+        # Wrap detail cleanly into up to 2 lines
+        max_chars = 58
+        line1 = detail[:max_chars]
+        line2 = detail[max_chars:max_chars * 2]
+        if len(detail) > max_chars * 2:
+            line2 = line2[:-3] + "..."
+        draw_text(surface, fonts.get(12, bold=False), line1, TEXT_SECONDARY, (info_rect.left + 16, info_rect.top + 76))
+        if line2:
+            draw_text(surface, fonts.get(12, bold=False), line2, TEXT_SECONDARY, (info_rect.left + 16, info_rect.top + 96))
+
+        busy = status in ("checking", "updating")
+        self.check_btn.enabled = not busy
+        if state["restart_required"]:
+            self.action_btn.label = "Restart Now"
+            self.action_btn.bg_color = BTN_RAISE
+            self.action_btn.hover_color = BTN_RAISE_HOVER
+            self.action_btn.enabled = True
+        else:
+            self.action_btn.label = "Updating..." if status == "updating" else "Update Now"
+            self.action_btn.bg_color = BTN_CALL
+            self.action_btn.hover_color = BTN_CALL_HOVER
+            self.action_btn.enabled = not busy
+
+        self.check_btn.draw(surface, fonts)
+        self.action_btn.draw(surface, fonts)
+        self.close_btn.draw(surface, fonts)

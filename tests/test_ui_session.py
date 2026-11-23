@@ -1,7 +1,10 @@
-"""Tests for the state-driven multi-player session, side pots, runouts, and headless UI."""
+"""Tests for the state-driven multi-player session, side pots, runouts, updater, and headless UI."""
 
+import io
 import os
+import tempfile
 import unittest
+import zipfile
 from unittest.mock import patch
 
 import pygame
@@ -13,6 +16,7 @@ from texas_holdem import (
     estimate_all_in_equities,
 )
 from texas_holdem_gui import PokerTableApp
+from ui_updater import LOCAL_COMMIT_FILE, apply_zip_update, check_for_updates
 
 
 class SidePotAndEquityTests(unittest.TestCase):
@@ -108,13 +112,13 @@ class TexasHoldemSessionTests(unittest.TestCase):
         session.choose_run_count(1)
         self.assertEqual(session.phase, "reveal_board")
 
-        session.step_reveal_board()  # Flop
-        self.assertEqual(len(session.game.board), 3)
-        self.assertEqual(session.phase, "reveal_board")
-        session.step_reveal_board()  # Turn
-        self.assertEqual(len(session.game.board), 4)
-        self.assertEqual(session.phase, "reveal_board")
-        session.step_reveal_board()  # River -> Showdown
+        # Card-by-card reveal (1 -> 2 -> 3 -> 4 -> 5)
+        for expected_len in (1, 2, 3, 4):
+            session.step_reveal_board()
+            self.assertEqual(len(session.game.board), expected_len)
+            self.assertEqual(session.phase, "reveal_board")
+
+        session.step_reveal_board()  # 5th card (River) -> Showdown
         self.assertEqual(len(session.game.board), 5)
         self.assertEqual(session.phase, "hand_over")
         self.assertEqual(
@@ -122,7 +126,7 @@ class TexasHoldemSessionTests(unittest.TestCase):
             200,
         )
 
-    def test_all_in_run_it_twice_splits_boards_and_conserves_chips(self):
+    def test_all_in_run_it_twice_deals_run1_then_run2_one_card_at_a_time(self):
         session = TexasHoldemSession(
             starting_chips=150, small_blind=5, big_blind=10, num_computers=3
         )
@@ -150,12 +154,22 @@ class TexasHoldemSessionTests(unittest.TestCase):
         session.choose_run_count(2)
         self.assertEqual(session.phase, "reveal_board")
 
-        while session.phase == "reveal_board":
+        # Run 1 deals 5 cards one by one while Run 2 stays at 0
+        for expected_r1 in (1, 2, 3, 4, 5):
             session.step_reveal_board()
+            self.assertEqual(len(session.run_boards[0]), expected_r1)
+            self.assertEqual(len(session.run_boards[1]), 0)
+            self.assertEqual(session.phase, "reveal_board")
 
+        # Run 2 then deals 5 cards one by one until Showdown
+        for expected_r2 in (1, 2, 3, 4):
+            session.step_reveal_board()
+            self.assertEqual(len(session.run_boards[1]), expected_r2)
+            self.assertEqual(session.phase, "reveal_board")
+
+        session.step_reveal_board()
         self.assertEqual(session.phase, "hand_over")
         self.assertEqual(session.run_count, 2)
-        self.assertEqual(len(session.run_boards), 2)
         self.assertEqual(len(session.run_boards[0]), 5)
         self.assertEqual(len(session.run_boards[1]), 5)
         self.assertEqual(session.game.pot, 0)
@@ -190,18 +204,58 @@ class TexasHoldemSessionTests(unittest.TestCase):
             self.assertEqual(session.game.button_index, 1 - first_button)
 
 
+class UpdaterTests(unittest.TestCase):
+    def test_check_for_updates_detects_new_commit_for_zip_install(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, LOCAL_COMMIT_FILE), "w", encoding="utf-8") as fh:
+                fh.write("1111111111111111111111111111111111111111\n")
+
+            fake_remote = {
+                "sha": "2222222222222222222222222222222222222222",
+                "short_sha": "2222222",
+                "message": "feat: new version",
+                "date": "2026-11-23T08:00:00Z",
+            }
+            with patch("ui_updater.fetch_remote_latest", return_value=fake_remote):
+                res = check_for_updates(tmpdir)
+
+            self.assertTrue(res["ok"])
+            self.assertTrue(res["has_update"])
+            self.assertEqual(res["short_sha"], "2222222")
+
+    def test_apply_zip_update_extracts_files_safely_and_records_sha(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("repo-main/texas_holdem_gui.py", "# updated gui\n")
+            zf.writestr("repo-main/requirements.txt", "pygame-ce>=2.5.0\n")
+            zf.writestr("repo-main/../evil.txt", "blocked")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            res = apply_zip_update(tmpdir, buf.getvalue(), target_sha="abcdef1234567")
+            self.assertEqual(res["updated_files"], 2)
+            self.assertTrue(res["requirements_changed"])
+            with open(os.path.join(tmpdir, "texas_holdem_gui.py"), "r", encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "# updated gui\n")
+            with open(os.path.join(tmpdir, LOCAL_COMMIT_FILE), "r", encoding="utf-8") as fh:
+                self.assertEqual(fh.read().strip(), "abcdef1234567")
+            self.assertFalse(os.path.exists(os.path.join(os.path.dirname(tmpdir), "evil.txt")))
+
+
 class HeadlessGuiTests(unittest.TestCase):
     def test_pygame_ui_renders_multiplayer_and_modals_headless(self):
         os.environ["SDL_VIDEODRIVER"] = "dummy"
         os.environ["SDL_AUDIODRIVER"] = "dummy"
         try:
             for count in (1, 3, 5):
-                app = PokerTableApp(headless=True, num_computers=count)
+                app = PokerTableApp(headless=True, num_computers=count, check_updates=False)
                 app.update(0.016)
                 app.render()
             app.setup_modal.visible = True
             app.render()
             app.setup_modal.visible = False
+            app.update_modal.visible = True
+            app.render()
+            app.update_modal.visible = False
             app.rules_modal.visible = True
             app.show_log = True
             app.render()
