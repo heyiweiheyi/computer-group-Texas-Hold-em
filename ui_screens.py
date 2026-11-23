@@ -52,6 +52,13 @@ class TitleScreen:
             shortcut="Enter",
             radius=14,
         )
+        self.btn_saves = ActionButton(
+            (610, 514, 246, 56),
+            "SAVED GAMES (0/3)",
+            BTN_RAISE,
+            BTN_RAISE_HOVER,
+            radius=14,
+        )
         self.btn_rules = ActionButton(
             (WINDOW_WIDTH - 196, 18, 86, 34),
             "Rules ?",
@@ -68,6 +75,14 @@ class TitleScreen:
         )
         self._rotated_cache = {}
 
+    def _layout_buttons(self, saves_count):
+        if saves_count > 0:
+            self.btn_start.rect = pygame.Rect(344, 514, 246, 56)
+            self.btn_saves.rect = pygame.Rect(610, 514, 246, 56)
+            self.btn_saves.label = f"SAVED GAMES ({saves_count}/3)"
+        else:
+            self.btn_start.rect = pygame.Rect((WINDOW_WIDTH - 270) // 2, 514, 270, 58)
+
     def _get_fanned_card(self, card_renderer, idx, angle):
         key = (idx, angle)
         if key not in self._rotated_cache:
@@ -76,19 +91,23 @@ class TitleScreen:
             self._rotated_cache[key] = pygame.transform.rotozoom(surf, angle, 1.08)
         return self._rotated_cache[key]
 
-    def handle_event(self, event):
-        """Return 'start', 'rules', 'update', or None."""
+    def handle_event(self, event, saves_count=0):
+        """Return 'start', 'saves', 'rules', 'update', or None."""
+        self._layout_buttons(saves_count)
         if event.type == pygame.KEYDOWN and event.key in (pygame.K_RETURN, pygame.K_SPACE):
             return "start"
         if self.btn_start.handle_event(event):
             return "start"
+        if saves_count > 0 and self.btn_saves.handle_event(event):
+            return "saves"
         if self.btn_rules.handle_event(event):
             return "rules"
         if self.btn_update.handle_event(event):
             return "update"
         return None
 
-    def draw(self, surface, fonts, table_surface, card_renderer, upd_state, now):
+    def draw(self, surface, fonts, table_surface, card_renderer, upd_state, now, saves_count=0):
+        self._layout_buttons(saves_count)
         surface.blit(table_surface, (0, 0))
 
         # Deep atmospheric vignette over the table
@@ -152,11 +171,18 @@ class TitleScreen:
         )
 
         self.btn_start.draw(surface, fonts)
+        if saves_count > 0:
+            self.btn_saves.draw(surface, fonts)
 
+        hint_txt = (
+            "Start a new table or resume one of your saved unfinished matches"
+            if saves_count > 0
+            else "Click START GAME or press Enter to pick your table size and AI rivals"
+        )
         draw_text(
             surface,
             fonts.get(12, bold=False),
-            "Click START GAME or press Enter to pick your table size and AI rivals",
+            hint_txt,
             TEXT_MUTED,
             (WINDOW_WIDTH // 2, 604),
             anchor="center",
@@ -211,6 +237,12 @@ class OpponentSelectScreen:
         self.blinds = (5, 10)
         self.selected_names = [AI_ROSTER[0]["name"], AI_ROSTER[2]["name"], AI_ROSTER[5]["name"]]
         self.hovered_card_idx = -1
+        self.can_resume = False
+        self.active_cfg = None
+        self.active_hand_number = 0
+
+        # Header Saves button
+        self.btn_saves = ActionButton((544, 18, 134, 30), "Saved (0/3)", BTN_NEUTRAL, BTN_NEUTRAL_HOVER, radius=8)
 
         # Configuration bar controls
         self.size_buttons = []
@@ -260,19 +292,77 @@ class OpponentSelectScreen:
         self.btn_random = ActionButton((764, 672, 160, 46), "Random Pick", BTN_NEUTRAL, BTN_NEUTRAL_HOVER, radius=10)
         self.btn_deal = ActionButton((942, 672, 216, 46), "Deal Cards!", BTN_CALL, BTN_CALL_HOVER, shortcut="Enter", radius=10)
 
-    def sync_from_session(self, session):
+    def sync_from_session(self, session, can_resume=False, active_cfg=None):
+        self.can_resume = bool(can_resume)
+        self.active_cfg = dict(active_cfg) if active_cfg else None
+        self.active_hand_number = int(session.hand_number) if session else 0
         self.num_computers = session.num_computers
         self.starting_chips = session.starting_chips
         self.blinds = (session.small_blind, session.big_blind)
+
+        roster_names = {entry["name"] for entry in AI_ROSTER}
         if session.opponents:
-            self.selected_names = [p["name"] for p in session.opponents][: self.num_computers]
+            names = [p["name"] for p in session.opponents if p.get("name") in roster_names]
         else:
-            self.selected_names = self.selected_names[: self.num_computers]
+            names = [p.name for p in session.game.players[1:] if p.name in roster_names]
+
+        if len(names) == self.num_computers:
+            self.selected_names = names
+        else:
+            self.selected_names = names[: self.num_computers]
             while len(self.selected_names) < self.num_computers:
                 for entry in AI_ROSTER:
                     if entry["name"] not in self.selected_names:
                         self.selected_names.append(entry["name"])
                         break
+
+    def is_unchanged_from_active(self):
+        if not self.can_resume or not self.active_cfg:
+            return False
+        active_names = self.active_cfg.get("selected_names", [])
+        return (
+            self.num_computers == self.active_cfg.get("num_computers")
+            and self.starting_chips == self.active_cfg.get("starting_chips")
+            and self.blinds == (self.active_cfg.get("small_blind"), self.active_cfg.get("big_blind"))
+            and len(self.selected_names) == len(active_names)
+            and set(self.selected_names) == set(active_names)
+        )
+
+    def _sync_dynamic_buttons(self, saves_count=0):
+        if self.can_resume:
+            self.btn_back.rect = pygame.Rect(42, 672, 168, 46)
+            self.btn_back.label = "Back to Table"
+        else:
+            self.btn_back.rect = pygame.Rect(42, 672, 128, 46)
+            self.btn_back.label = "Back"
+
+        self.btn_saves.label = f"Saved ({saves_count}/3)"
+        if saves_count > 0:
+            self.btn_saves.bg_color = BTN_RAISE
+            self.btn_saves.hover_color = BTN_RAISE_HOVER
+        else:
+            self.btn_saves.bg_color = BTN_NEUTRAL
+            self.btn_saves.hover_color = BTN_NEUTRAL_HOVER
+
+        chosen_count = len(self.selected_names)
+        ready = chosen_count == self.num_computers
+        self.btn_deal.enabled = ready
+        if not ready:
+            self.btn_deal.label = f"Pick {self.num_computers - chosen_count} More"
+            self.btn_deal.bg_color = BTN_CALL
+            self.btn_deal.hover_color = BTN_CALL_HOVER
+        elif self.is_unchanged_from_active():
+            self.btn_deal.label = "Resume Match"
+            self.btn_deal.bg_color = BTN_CALL
+            self.btn_deal.hover_color = BTN_CALL_HOVER
+        elif self.can_resume:
+            self.btn_deal.label = "Start New Match"
+            self.btn_deal.bg_color = BTN_RAISE
+            self.btn_deal.hover_color = BTN_RAISE_HOVER
+        else:
+            self.btn_deal.label = "Deal Cards!"
+            self.btn_deal.bg_color = BTN_CALL
+            self.btn_deal.hover_color = BTN_CALL_HOVER
 
     def _toggle_ai(self, name):
         if name in self.selected_names:
@@ -297,8 +387,9 @@ class OpponentSelectScreen:
             "big_blind": self.blinds[1],
         }
 
-    def handle_event(self, event):
-        """Return ('back', None), ('start', payload), or (None, None)."""
+    def handle_event(self, event, saves_count=0):
+        """Return ('back', None), ('resume', None), ('saves', None), ('start', payload), or (None, None)."""
+        self._sync_dynamic_buttons(saves_count)
         if event.type == pygame.MOUSEMOTION:
             self.hovered_card_idx = -1
             for idx, rect in enumerate(self.card_rects):
@@ -308,9 +399,14 @@ class OpponentSelectScreen:
 
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
-                return ("back", None)
+                return ("resume", None) if self.can_resume else ("back", None)
             if event.key in (pygame.K_RETURN, pygame.K_SPACE) and len(self.selected_names) == self.num_computers:
+                if self.is_unchanged_from_active():
+                    return ("resume", None)
                 return ("start", self._build_payload())
+
+        if self.btn_saves.handle_event(event):
+            return ("saves", None)
 
         for count, btn in self.size_buttons:
             if btn.handle_event(event):
@@ -336,7 +432,7 @@ class OpponentSelectScreen:
                     return (None, None)
 
         if self.btn_back.handle_event(event):
-            return ("back", None)
+            return ("resume", None) if self.can_resume else ("back", None)
         if self.btn_random.handle_event(event):
             self._random_pick()
             return (None, None)
@@ -344,6 +440,8 @@ class OpponentSelectScreen:
         ready = len(self.selected_names) == self.num_computers
         self.btn_deal.enabled = ready
         if self.btn_deal.handle_event(event) and ready:
+            if self.is_unchanged_from_active():
+                return ("resume", None)
             return ("start", self._build_payload())
 
         return (None, None)
@@ -354,7 +452,8 @@ class OpponentSelectScreen:
             return name.upper()
         return name[:2].upper()
 
-    def draw(self, surface, fonts):
+    def draw(self, surface, fonts, saves_count=0):
+        self._sync_dynamic_buttons(saves_count)
         surface.fill(BG_OUTER)
 
         # Header
@@ -372,6 +471,8 @@ class OpponentSelectScreen:
             TEXT_SECONDARY,
             (42, 54),
         )
+
+        self.btn_saves.draw(surface, fonts)
 
         # Strength tier legend top-right
         lx = 694
@@ -503,18 +604,23 @@ class OpponentSelectScreen:
         chosen_count = len(self.selected_names)
         ready = chosen_count == self.num_computers
         if ready:
-            names_preview = ", ".join(self.selected_names)
-            status_text = f"Selected {chosen_count}/{self.num_computers} AI: {names_preview}"
-            status_col = (72, 206, 146)
+            if self.is_unchanged_from_active():
+                status_text = f"Unchanged lineup — Resume Match (Hand #{self.active_hand_number})"
+                status_col = (72, 206, 146)
+            elif self.can_resume:
+                status_text = "Lineup changed — Start New Match (current match auto-saved)"
+                status_col = GOLD_BRIGHT
+            else:
+                names_preview = ", ".join(self.selected_names)
+                status_text = f"Selected {chosen_count}/{self.num_computers} AI: {names_preview}"
+                status_col = (72, 206, 146)
         else:
             needed = self.num_computers - chosen_count
-            status_text = f"Selected {chosen_count}/{self.num_computers} AI  —  Please pick {needed} more opponent(s)"
+            status_text = f"Selected {chosen_count}/{self.num_computers} AI  —  Pick {needed} more"
             status_col = GOLD_BRIGHT
 
-        draw_text(surface, fonts.get(14, bold=True), status_text, status_col, (194, 695), anchor="midleft")
-
-        self.btn_deal.enabled = ready
-        self.btn_deal.label = "Deal Cards!" if ready else f"Pick {self.num_computers - chosen_count} More"
+        status_x = self.btn_back.rect.right + 18
+        draw_text(surface, fonts.get(13, bold=True), status_text, status_col, (status_x, 695), anchor="midleft")
 
         self.btn_back.draw(surface, fonts)
         self.btn_random.draw(surface, fonts)

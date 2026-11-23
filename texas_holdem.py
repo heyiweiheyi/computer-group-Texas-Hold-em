@@ -1716,6 +1716,292 @@ class TexasHoldemSession:
             return "Suited Hand"
         return "High Card"
 
+    @staticmethod
+    def _serialize_card(card):
+        return [card.rank, card.suit]
+
+    @classmethod
+    def _serialize_player_eval(cls, res):
+        if res is None:
+            return None
+        return {
+            "score": list(res["score"]),
+            "best_five": [cls._serialize_card(c) for c in res["best_five"]],
+            "hand_name": res["hand_name"],
+        }
+
+    @classmethod
+    def _deserialize_player_eval(cls, data, get_card):
+        if data is None:
+            return None
+        return {
+            "score": tuple(data["score"]),
+            "best_five": [get_card(r, s) for r, s in data["best_five"]],
+            "hand_name": data["hand_name"],
+        }
+
+    @classmethod
+    def _serialize_board_result(cls, res):
+        return {
+            "board": [cls._serialize_card(c) for c in res["board"]],
+            "player_results": {
+                str(idx): cls._serialize_player_eval(val)
+                for idx, val in res["player_results"].items()
+            },
+            "pot_awards": [
+                {
+                    "pot_name": a["pot_name"],
+                    "amount": int(a["amount"]),
+                    "winners": [int(w) for w in a["winners"]],
+                    "share": int(a["share"]),
+                }
+                for a in res["pot_awards"]
+            ],
+            "total_by_player": {
+                str(idx): int(amt) for idx, amt in res["total_by_player"].items()
+            },
+        }
+
+    @classmethod
+    def _deserialize_board_result(cls, data, get_card):
+        return {
+            "board": [get_card(r, s) for r, s in data["board"]],
+            "player_results": {
+                int(idx): cls._deserialize_player_eval(val, get_card)
+                for idx, val in data["player_results"].items()
+            },
+            "pot_awards": [
+                {
+                    "pot_name": a["pot_name"],
+                    "amount": int(a["amount"]),
+                    "winners": [int(w) for w in a["winners"]],
+                    "share": int(a["share"]),
+                }
+                for a in data["pot_awards"]
+            ],
+            "total_by_player": {
+                int(idx): int(amt) for idx, amt in data["total_by_player"].items()
+            },
+        }
+
+    def to_dict(self):
+        """Serialize full match and hand state into a JSON-compatible dictionary."""
+        players_data = []
+        for p in self.game.players:
+            players_data.append(
+                {
+                    "name": p.name,
+                    "chips": int(p.chips),
+                    "is_human": bool(p.is_human),
+                    "tier": getattr(p, "tier", "Pro"),
+                    "tag": getattr(p, "tag", ""),
+                    "hole_cards": [self._serialize_card(c) for c in p.hole_cards],
+                }
+            )
+
+        run_results_data = [
+            self._serialize_board_result(res) for res in self.run_results
+        ]
+
+        showdown_data = None
+        if self.showdown_result is not None:
+            sr = self.showdown_result
+            showdown_data = {
+                "refund_log": sr.get("refund_log"),
+                "player_results": [
+                    self._serialize_player_eval(item)
+                    for item in sr.get("player_results", [])
+                ],
+                "pot_awards": [
+                    {
+                        "pot_name": a["pot_name"],
+                        "amount": int(a["amount"]),
+                        "winners": [int(w) for w in a["winners"]],
+                        "share": int(a["share"]),
+                    }
+                    for a in sr.get("pot_awards", [])
+                ],
+                "total_by_player": {
+                    str(idx): int(amt)
+                    for idx, amt in sr.get("total_by_player", {}).items()
+                },
+                "winner_index": sr.get("winner_index"),
+                "pot_awarded": int(sr.get("pot_awarded", 0)),
+                "half_pot": int(sr.get("half_pot", 0)),
+                "odd_chip": int(sr.get("odd_chip", 0)),
+                "run_it_twice": bool(sr.get("run_it_twice", False)),
+            }
+
+        return {
+            "version": 1,
+            "starting_chips": int(self.starting_chips),
+            "small_blind": int(self.small_blind),
+            "big_blind": int(self.big_blind),
+            "num_computers": int(self.num_computers),
+            "max_computers": int(self.max_computers),
+            "opponents": [dict(p) for p in self.opponents] if self.opponents is not None else None,
+            "phase": self.phase,
+            "street": self.street,
+            "hand_number": int(self.hand_number),
+            "min_raise": int(self.min_raise),
+            "last_full_bet": int(self.last_full_bet),
+            "acted_since_full_raise": sorted(int(i) for i in self.acted_since_full_raise),
+            "pending": [int(i) for i in self.pending],
+            "last_actions": list(self.last_actions),
+            "action_log": list(self.action_log),
+            "winner_index": self.winner_index,
+            "win_reason": self.win_reason,
+            "pot_awarded": int(self.pot_awarded),
+            "equities": {str(k): float(v) for k, v in self.equities.items()},
+            "run_count": int(self.run_count),
+            "run_boards": [
+                [self._serialize_card(c) for c in b] for b in self.run_boards
+            ],
+            "run_results": run_results_data,
+            "active_run_index": int(self.active_run_index),
+            "run_start_board_len": int(self.run_start_board_len),
+            "runout_status": self.runout_status,
+            "refund_logs": list(self.refund_logs),
+            "won_this_hand": {str(k): int(v) for k, v in self.won_this_hand.items()},
+            "showdown_result": showdown_data,
+            "game": {
+                "button_index": int(self.game.button_index),
+                "pot": int(self.game.pot),
+                "round_bets": [int(x) for x in self.game.round_bets],
+                "hand_contributions": [int(x) for x in self.game.hand_contributions],
+                "folded": [bool(x) for x in self.game.folded],
+                "eliminated": [bool(x) for x in self.game.eliminated],
+                "board": [self._serialize_card(c) for c in self.game.board],
+                "deck_cards": [
+                    self._serialize_card(c)
+                    for c in (self.game.deck.cards if self.game.deck else [])
+                ],
+                "players": players_data,
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        """Restore a TexasHoldemSession from a serialized dictionary."""
+        card_pool = {}
+
+        def get_card(rank, suit):
+            key = (int(rank), suit)
+            if key not in card_pool:
+                card_pool[key] = Card(key[0], key[1])
+            return card_pool[key]
+
+        session = cls.__new__(cls)
+        session.starting_chips = int(data["starting_chips"])
+        session.small_blind = int(data["small_blind"])
+        session.big_blind = int(data["big_blind"])
+        session.max_computers = int(data.get("max_computers", MAX_COMPUTERS))
+        session.num_computers = int(data["num_computers"])
+        raw_opps = data.get("opponents")
+        session.opponents = [dict(p) for p in raw_opps] if raw_opps is not None else None
+
+        gdata = data["game"]
+        game = TexasHoldemGame.__new__(TexasHoldemGame)
+        game.small_blind = session.small_blind
+        game.big_blind = session.big_blind
+        game.max_computers = session.max_computers
+        game.num_computers = session.num_computers
+
+        game.players = []
+        for pdata in gdata["players"]:
+            if pdata["is_human"]:
+                player = Player(pdata["name"], int(pdata["chips"]), is_human=True)
+            else:
+                player = ComputerPlayer(
+                    pdata["name"],
+                    int(pdata["chips"]),
+                    tier=pdata.get("tier", "Pro"),
+                    tag=pdata.get("tag", ""),
+                )
+            player.hole_cards = [get_card(r, s) for r, s in pdata.get("hole_cards", [])]
+            game.players.append(player)
+
+        game.button_index = int(gdata["button_index"])
+        game.pot = int(gdata["pot"])
+        game.round_bets = [int(x) for x in gdata["round_bets"]]
+        game.hand_contributions = [int(x) for x in gdata["hand_contributions"]]
+        game.folded = [bool(x) for x in gdata["folded"]]
+        game.eliminated = [bool(x) for x in gdata["eliminated"]]
+        game.board = [get_card(r, s) for r, s in gdata.get("board", [])]
+
+        deck = Deck.__new__(Deck)
+        deck.cards = [Card(int(r), s) for r, s in gdata.get("deck_cards", [])]
+        game.deck = deck
+
+        session.game = game
+        session.phase = data["phase"]
+        session.street = data["street"]
+        session.hand_number = int(data["hand_number"])
+        session.min_raise = int(data["min_raise"])
+        session.last_full_bet = int(data.get("last_full_bet", 0))
+        session.acted_since_full_raise = set(
+            int(i) for i in data.get("acted_since_full_raise", [])
+        )
+        session.pending = [int(i) for i in data.get("pending", [])]
+        session.last_actions = list(data.get("last_actions", []))
+        session.action_log = list(data.get("action_log", []))
+        session.winner_index = data.get("winner_index")
+        session.win_reason = data.get("win_reason")
+        session.pot_awarded = int(data.get("pot_awarded", 0))
+        session.equities = {
+            int(k): float(v) for k, v in data.get("equities", {}).items()
+        }
+        session.run_count = int(data.get("run_count", 1))
+        session.run_boards = [
+            [get_card(r, s) for r, s in b] for b in data.get("run_boards", [])
+        ]
+        session.run_results = [
+            cls._deserialize_board_result(res, get_card)
+            for res in data.get("run_results", [])
+        ]
+        session.active_run_index = int(data.get("active_run_index", 0))
+        session.run_start_board_len = int(data.get("run_start_board_len", 0))
+        session.runout_status = data.get("runout_status", "")
+        session.refund_logs = list(data.get("refund_logs", []))
+        session.won_this_hand = {
+            int(k): int(v) for k, v in data.get("won_this_hand", {}).items()
+        }
+
+        sr_data = data.get("showdown_result")
+        if sr_data is None:
+            session.showdown_result = None
+        else:
+            sr = {
+                "refund_log": sr_data.get("refund_log"),
+                "player_results": [
+                    cls._deserialize_player_eval(item, get_card)
+                    for item in sr_data.get("player_results", [])
+                ],
+                "pot_awards": [
+                    {
+                        "pot_name": a["pot_name"],
+                        "amount": int(a["amount"]),
+                        "winners": [int(w) for w in a["winners"]],
+                        "share": int(a["share"]),
+                    }
+                    for a in sr_data.get("pot_awards", [])
+                ],
+                "total_by_player": {
+                    int(k): int(v)
+                    for k, v in sr_data.get("total_by_player", {}).items()
+                },
+                "winner_index": sr_data.get("winner_index"),
+                "pot_awarded": int(sr_data.get("pot_awarded", 0)),
+                "half_pot": int(sr_data.get("half_pot", 0)),
+                "odd_chip": int(sr_data.get("odd_chip", 0)),
+            }
+            if sr_data.get("run_it_twice"):
+                sr["run_it_twice"] = True
+                sr["run_results"] = session.run_results
+            session.showdown_result = sr
+
+        return session
+
 
 def main():
     game = TexasHoldemGame()

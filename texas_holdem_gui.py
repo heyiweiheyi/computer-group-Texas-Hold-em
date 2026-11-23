@@ -57,6 +57,7 @@ from ui_theme import (
     ease_out_cubic,
     lerp,
 )
+from ui_saves import MatchSaveManager, is_session_finished
 from ui_screens import OpponentSelectScreen, TitleScreen
 from ui_updater import UpdateController
 from ui_widgets import (
@@ -64,6 +65,7 @@ from ui_widgets import (
     HandSummaryModal,
     RaiseControl,
     RulesModal,
+    SavesModal,
     SetupModal,
     UpdateModal,
 )
@@ -129,7 +131,14 @@ class FontManagerWrapper:
 class PokerTableApp:
     """Main Pygame application driving TexasHoldemSession at 60 FPS."""
 
-    def __init__(self, headless=False, num_computers=1, check_updates=None, start_screen=None):
+    def __init__(
+        self,
+        headless=False,
+        num_computers=1,
+        check_updates=None,
+        start_screen=None,
+        save_dir=None,
+    ):
         if headless:
             os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
@@ -154,6 +163,8 @@ class PokerTableApp:
         self.clock = pygame.time.Clock()
 
         self.app_dir = os.path.dirname(os.path.abspath(__file__))
+        persist_saves = (not headless) or (save_dir is not None)
+        self.save_manager = MatchSaveManager(save_dir or self.app_dir, persist=persist_saves)
         self.fonts = FontManagerWrapper()
         self.table_surface = build_table_surface(WINDOW_WIDTH, WINDOW_HEIGHT, self.fonts.palette)
         self.card_renderer = CardRenderer(self.fonts.palette)
@@ -172,10 +183,13 @@ class PokerTableApp:
         self.setup_modal = SetupModal(WINDOW_WIDTH, WINDOW_HEIGHT, max_computers=MAX_COMPUTERS)
         self.update_modal = UpdateModal(WINDOW_WIDTH, WINDOW_HEIGHT)
         self.summary_modal = HandSummaryModal(WINDOW_WIDTH, WINDOW_HEIGHT)
+        self.saves_modal = SavesModal(WINDOW_WIDTH, WINDOW_HEIGHT)
         self.updater = UpdateController(self.app_dir)
         self.update_toast_dismissed = False
         self._restart_requested = False
         self.show_log = False
+        self.has_active_match = self.screen_mode == "table"
+        self.active_save_id = None
 
         self.display_chips = [float(p.chips) for p in self.session.game.players]
         self.display_pot = float(self.session.game.pot)
@@ -192,6 +206,8 @@ class PokerTableApp:
         self._build_controls()
         self._trigger_new_hand_anims()
         self._sync_timers_and_controls(reset_raise=True)
+        if self.has_active_match:
+            self._autosave_current_match()
 
         should_check = (not headless) if check_updates is None else bool(check_updates)
         if should_check:
@@ -248,6 +264,7 @@ class PokerTableApp:
 
     def _build_controls(self):
         # Top utility bar buttons
+        self.btn_saves = ActionButton((476, 9, 104, 30), "Saves (0/3)", BTN_NEUTRAL, BTN_NEUTRAL_HOVER, radius=8)
         self.btn_update = ActionButton((588, 9, 98, 30), "Update", BTN_NEUTRAL, BTN_NEUTRAL_HOVER, radius=8)
         self.btn_setup = ActionButton((694, 9, 128, 30), "Table: 1 AI", BTN_RAISE, BTN_RAISE_HOVER, radius=8)
         self.btn_log = ActionButton((830, 9, 72, 30), "Log", BTN_NEUTRAL, BTN_NEUTRAL_HOVER, radius=8)
@@ -411,6 +428,76 @@ class PokerTableApp:
         self.prev_pot = self.session.game.pot
         self.prev_phase = self.session.phase
         self._sync_timers_and_controls(reset_raise=(self.session.phase == "waiting_human" and previous_phase != "waiting_human"))
+        self._autosave_current_match()
+
+    def _current_match_config(self):
+        return {
+            "num_computers": self.session.num_computers,
+            "starting_chips": self.session.starting_chips,
+            "small_blind": self.session.small_blind,
+            "big_blind": self.session.big_blind,
+            "selected_names": [p.name for p in self.session.game.players[1:]],
+        }
+
+    def _autosave_current_match(self):
+        if not self.has_active_match:
+            return
+        if is_session_finished(self.session):
+            if self.active_save_id:
+                self.save_manager.delete_save(self.active_save_id)
+                self.active_save_id = None
+            return
+        self.active_save_id = self.save_manager.save_match(self.active_save_id, self.session)
+
+    def _start_fresh_match(self, payload=None, new_slot=True):
+        if new_slot and self.has_active_match:
+            self._autosave_current_match()
+            self.active_save_id = None
+        self.summary_modal.visible = False
+        self.summary_popup_at = 0.0
+        self.session.start_new_match(**(payload or {}))
+        self.has_active_match = True
+        self.prev_pot = self.session.game.pot
+        self._trigger_new_hand_anims()
+        self._sync_timers_and_controls(reset_raise=True)
+        self._autosave_current_match()
+        self.screen_mode = "table"
+
+    def _resume_saved_match(self, save_id):
+        if self.has_active_match and save_id == self.active_save_id:
+            self._sync_timers_and_controls(reset_raise=False)
+            self.screen_mode = "table"
+            return True
+
+        if self.has_active_match:
+            self._autosave_current_match()
+
+        restored = self.save_manager.load_session(save_id)
+        if restored is None:
+            return False
+
+        self.summary_modal.visible = False
+        self.summary_popup_at = 0.0
+        self.session = restored
+        self.active_save_id = save_id
+        self.has_active_match = True
+        self.display_chips = [float(p.chips) for p in self.session.game.players]
+        self.display_pot = float(self.session.game.pot)
+        self.card_anims = {}
+        self.prev_board_len = len(self.session.game.board)
+        self.prev_run_lens = (
+            [len(b) for b in self.session.run_boards]
+            if len(self.session.run_boards) == 2
+            else [0, 0]
+        )
+        self.prev_pot = self.session.game.pot
+        self.prev_phase = self.session.phase
+        self.ai_wait_until = 0.0
+        self.runout_wait_until = 0.0
+        self._sync_timers_and_controls(reset_raise=True)
+        self._autosave_current_match()
+        self.screen_mode = "table"
+        return True
 
     def _submit_human_raise_from_slider(self):
         if self.session.phase != "waiting_human":
@@ -449,11 +536,9 @@ class PokerTableApp:
                 self.prev_pot = self.session.game.pot
                 self._trigger_new_hand_anims()
             self._sync_timers_and_controls(reset_raise=True)
+            self._autosave_current_match()
         elif self.session.phase == "match_over":
-            self.session.start_new_match()
-            self.prev_pot = self.session.game.pot
-            self._trigger_new_hand_anims()
-            self._sync_timers_and_controls(reset_raise=True)
+            self._start_fresh_match(new_slot=True)
 
     def handle_event(self, event):
         if event.type == pygame.VIDEORESIZE and not self.headless:
@@ -478,22 +563,31 @@ class PokerTableApp:
         if self.setup_modal.visible:
             new_cfg = self.setup_modal.handle_event(event)
             if new_cfg is not None:
-                self.summary_modal.visible = False
-                self.summary_popup_at = 0.0
-                self.session.start_new_match(**new_cfg)
-                self.prev_pot = self.session.game.pot
-                self._trigger_new_hand_anims()
-                self._sync_timers_and_controls(reset_raise=True)
+                self._start_fresh_match(new_cfg, new_slot=True)
             return
 
         if self.rules_modal.visible:
             self.rules_modal.handle_event(event)
             return
 
+        if self.saves_modal.visible:
+            save_action, save_id = self.saves_modal.handle_event(event, self.save_manager.list_saves())
+            if save_action == "resume" and save_id:
+                self._resume_saved_match(save_id)
+            elif save_action == "delete" and save_id:
+                self.save_manager.delete_save(save_id)
+                if save_id == self.active_save_id:
+                    self.active_save_id = None
+            return
+
         if self.screen_mode == "title":
-            action = self.title_screen.handle_event(event)
+            action = self.title_screen.handle_event(event, saves_count=self.save_manager.count())
             if action == "start":
+                self.select_screen.can_resume = False
+                self.select_screen.active_cfg = None
                 self.screen_mode = "select"
+            elif action == "saves":
+                self.saves_modal.visible = True
             elif action == "rules":
                 self.rules_modal.visible = True
             elif action == "update":
@@ -504,17 +598,16 @@ class PokerTableApp:
             return
 
         if self.screen_mode == "select":
-            action, payload = self.select_screen.handle_event(event)
+            action, payload = self.select_screen.handle_event(event, saves_count=self.save_manager.count())
             if action == "back":
                 self.screen_mode = "title"
-            elif action == "start" and payload:
-                self.summary_modal.visible = False
-                self.summary_popup_at = 0.0
-                self.session.start_new_match(**payload)
-                self.prev_pot = self.session.game.pot
-                self._trigger_new_hand_anims()
-                self._sync_timers_and_controls(reset_raise=True)
+            elif action == "resume":
+                self._sync_timers_and_controls(reset_raise=False)
                 self.screen_mode = "table"
+            elif action == "saves":
+                self.saves_modal.visible = True
+            elif action == "start" and payload:
+                self._start_fresh_match(payload, new_slot=True)
             return
 
         if self.summary_modal.visible:
@@ -562,6 +655,10 @@ class PokerTableApp:
                     self._advance_next_hand_or_match()
                     return
 
+        if self.btn_saves.handle_event(event):
+            self._autosave_current_match()
+            self.saves_modal.visible = True
+            return
         if self.btn_update.handle_event(event):
             self.update_toast_dismissed = True
             self.update_modal.visible = True
@@ -571,7 +668,13 @@ class PokerTableApp:
         if self.btn_setup.handle_event(event):
             self.summary_modal.visible = False
             self.summary_popup_at = 0.0
-            self.select_screen.sync_from_session(self.session)
+            self._autosave_current_match()
+            can_resume = self.has_active_match and not is_session_finished(self.session)
+            self.select_screen.sync_from_session(
+                self.session,
+                can_resume=can_resume,
+                active_cfg=self._current_match_config() if can_resume else None,
+            )
             self.screen_mode = "select"
             return
         if self.btn_log.handle_event(event):
@@ -582,12 +685,8 @@ class PokerTableApp:
         elif self.btn_rules.handle_event(event):
             self.rules_modal.visible = True
         elif self.btn_new_match.handle_event(event):
-            self.summary_modal.visible = False
-            self.summary_popup_at = 0.0
-            self.session.start_new_match()
-            self.prev_pot = self.session.game.pot
-            self._trigger_new_hand_anims()
-            self._sync_timers_and_controls(reset_raise=True)
+            has_progress = self.session.hand_number > 1 or len(self.session.action_log) > 3
+            self._start_fresh_match(new_slot=has_progress)
 
         # Clicking the hand-over result banner re-opens the detailed settlement modal
         if (
@@ -722,9 +821,11 @@ class PokerTableApp:
         pygame.draw.circle(self.screen, GOLD_BRIGHT, (24, 24), 6)
         draw_text(self.screen, self.fonts.get(17, bold=True), "TEXAS HOLD'EM", TEXT_PRIMARY, (40, 24), anchor="midleft")
         n_players = self.session.num_computers + 1
-        meta = f"Hand #{self.session.hand_number}  •  Blinds ${self.session.small_blind}/${self.session.big_blind}  •  {n_players}P Table"
+        meta = f"Hand #{self.session.hand_number}  •  ${self.session.small_blind}/${self.session.big_blind}  •  {n_players}P"
         draw_text(self.screen, self.fonts.get(13, bold=False), meta, TEXT_SECONDARY, (194, 24), anchor="midleft")
 
+        saves_count = self.save_manager.count()
+        self.btn_saves.label = f"Saves ({saves_count}/3)"
         upd = self.updater.snapshot()
         notify = upd["has_update"] or upd["restart_required"]
         if upd["restart_required"]:
@@ -748,7 +849,7 @@ class PokerTableApp:
             self.btn_update.bg_color = BTN_NEUTRAL
             self.btn_update.hover_color = BTN_NEUTRAL_HOVER
 
-        for btn in (self.btn_update, self.btn_setup, self.btn_log, self.btn_sound, self.btn_rules, self.btn_new_match):
+        for btn in (self.btn_saves, self.btn_update, self.btn_setup, self.btn_log, self.btn_sound, self.btn_rules, self.btn_new_match):
             btn.draw(self.screen, self.fonts.palette)
 
         # Pulsing red notification dot on Update button when GitHub has a new commit
@@ -1391,6 +1492,8 @@ class PokerTableApp:
     def render(self):
         now = time.monotonic()
         self._last_banner_rect = None
+        saves_list = self.save_manager.list_saves()
+        saves_count = len(saves_list)
         if self.screen_mode == "title":
             self.title_screen.draw(
                 self.screen,
@@ -1399,11 +1502,14 @@ class PokerTableApp:
                 self.card_renderer,
                 self.updater.snapshot(),
                 now,
+                saves_count=saves_count,
             )
+            self.saves_modal.draw(self.screen, self.fonts.palette, saves_list, active_save_id=self.active_save_id)
             self.rules_modal.draw(self.screen, self.fonts.palette)
             self.update_modal.draw(self.screen, self.fonts.palette, self.updater.snapshot())
         elif self.screen_mode == "select":
-            self.select_screen.draw(self.screen, self.fonts.palette)
+            self.select_screen.draw(self.screen, self.fonts.palette, saves_count=saves_count)
+            self.saves_modal.draw(self.screen, self.fonts.palette, saves_list, active_save_id=self.active_save_id)
         else:
             self.screen.blit(self.table_surface, (0, 0))
             self._draw_top_bar(now)
@@ -1414,6 +1520,7 @@ class PokerTableApp:
             self._draw_bottom_dock()
             self._draw_log_drawer()
             self.summary_modal.draw(self.screen, self.fonts.palette, self.session)
+            self.saves_modal.draw(self.screen, self.fonts.palette, saves_list, active_save_id=self.active_save_id)
             self.rules_modal.draw(self.screen, self.fonts.palette)
             self.setup_modal.draw(self.screen, self.fonts.palette)
             self.update_modal.draw(self.screen, self.fonts.palette, self.updater.snapshot())
@@ -1441,6 +1548,7 @@ class PokerTableApp:
                 break
             self.update(dt)
             self.render()
+        self._autosave_current_match()
         pygame.quit()
         if self._restart_requested:
             subprocess.Popen([sys.executable, os.path.abspath(__file__)], cwd=self.app_dir)

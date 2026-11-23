@@ -6,6 +6,8 @@ from ui_theme import (
     BTN_CALL,
     BTN_CALL_HOVER,
     BTN_DISABLED,
+    BTN_FOLD,
+    BTN_FOLD_HOVER,
     BTN_NEUTRAL,
     BTN_NEUTRAL_HOVER,
     BTN_RAISE,
@@ -856,3 +858,185 @@ class HandSummaryModal:
         self.next_btn.label = "Next Hand" if (human_alive and any_ai_alive) else "Finish Match"
         self.view_btn.draw(surface, fonts)
         self.next_btn.draw(surface, fonts)
+
+
+class SavesModal:
+    """Modal dialog displaying up to 3 saved unfinished matches with Resume / Delete controls."""
+
+    MAX_SLOTS = 3
+
+    def __init__(self, window_w, window_h):
+        self.visible = False
+        self.modal_rect = pygame.Rect((window_w - 680) // 2, (window_h - 476) // 2, 680, 476)
+        self.slot_rects = []
+        self.resume_btns = []
+        self.delete_btns = []
+
+        left = self.modal_rect.left + 26
+        slot_w = self.modal_rect.width - 52
+        for idx in range(self.MAX_SLOTS):
+            slot = pygame.Rect(left, self.modal_rect.top + 82 + idx * 110, slot_w, 98)
+            self.slot_rects.append(slot)
+            self.resume_btns.append(
+                ActionButton(
+                    (slot.right - 188, slot.bottom - 44, 94, 34),
+                    "Resume",
+                    BTN_CALL,
+                    BTN_CALL_HOVER,
+                    radius=8,
+                )
+            )
+            self.delete_btns.append(
+                ActionButton(
+                    (slot.right - 86, slot.bottom - 44, 72, 34),
+                    "Delete",
+                    BTN_FOLD,
+                    BTN_FOLD_HOVER,
+                    radius=8,
+                )
+            )
+
+        self.close_btn = ActionButton(
+            (self.modal_rect.right - 134, self.modal_rect.bottom - 54, 108, 36),
+            "Close",
+            BTN_NEUTRAL,
+            BTN_NEUTRAL_HOVER,
+            radius=8,
+        )
+
+    def handle_event(self, event, saves):
+        """Return ('resume', save_id), ('delete', save_id), or (None, None)."""
+        if not self.visible:
+            return (None, None)
+
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            self.visible = False
+            return (None, None)
+
+        if self.close_btn.handle_event(event):
+            self.visible = False
+            return (None, None)
+
+        for idx in range(min(self.MAX_SLOTS, len(saves))):
+            save_id = saves[idx]["id"]
+            if self.resume_btns[idx].handle_event(event):
+                self.visible = False
+                return ("resume", save_id)
+            if self.delete_btns[idx].handle_event(event):
+                return ("delete", save_id)
+
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if not self.modal_rect.collidepoint(event.pos):
+                self.visible = False
+        return (None, None)
+
+    def draw(self, surface, fonts, saves, active_save_id=None):
+        if not self.visible:
+            return
+
+        dim = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
+        dim.fill((6, 10, 16, 185))
+        surface.blit(dim, (0, 0))
+
+        pygame.draw.rect(surface, PANEL_BG, self.modal_rect, border_radius=16)
+        pygame.draw.rect(surface, GOLD_MID, self.modal_rect, width=1, border_radius=16)
+
+        left = self.modal_rect.left + 26
+        draw_text(
+            surface,
+            fonts.get(20, bold=True),
+            "Saved Matches (Unfinished)",
+            GOLD_BRIGHT,
+            (left, self.modal_rect.top + 20),
+        )
+        draw_text(
+            surface,
+            fonts.get(12, bold=False),
+            "Automatically keeps your 3 most recent unfinished matches — click Resume to continue",
+            TEXT_SECONDARY,
+            (left, self.modal_rect.top + 48),
+        )
+
+        for idx in range(self.MAX_SLOTS):
+            slot = self.slot_rects[idx]
+            if idx < len(saves):
+                entry = saves[idx]
+                is_current = active_save_id is not None and entry["id"] == active_save_id
+                pygame.draw.rect(surface, PANEL_BG_ALT, slot, border_radius=10)
+                border_col = (72, 206, 146) if is_current else PANEL_BORDER
+                pygame.draw.rect(surface, border_col, slot, width=2 if is_current else 1, border_radius=10)
+
+                # Slot number badge
+                badge = pygame.Rect(slot.left + 12, slot.top + 12, 34, 22)
+                pygame.draw.rect(surface, (28, 42, 62), badge, border_radius=6)
+                pygame.draw.rect(surface, GOLD_MID, badge, width=1, border_radius=6)
+                draw_text(surface, fonts.get(11, bold=True), f"#{idx + 1}", GOLD_BRIGHT, badge.center, anchor="center")
+
+                # Header line: Hand #, table size, blinds
+                title_x = badge.right + 10
+                title = (
+                    f"Hand #{entry['hand_number']}  •  {entry['num_players']}P Table  •  "
+                    f"Blinds ${entry['small_blind']}/${entry['big_blind']}"
+                )
+                title_rect = draw_text(surface, fonts.get(14, bold=True), title, TEXT_PRIMARY, (title_x, slot.top + 13))
+
+                if is_current:
+                    cur_pill = pygame.Rect(title_rect.right + 10, slot.top + 13, 66, 20)
+                    pygame.draw.rect(surface, (20, 74, 54), cur_pill, border_radius=6)
+                    pygame.draw.rect(surface, (72, 206, 146), cur_pill, width=1, border_radius=6)
+                    draw_text(surface, fonts.get(10, bold=True), "ACTIVE", (176, 248, 212), cur_pill.center, anchor="center")
+
+                # Timestamp top-right
+                draw_text(
+                    surface,
+                    fonts.get(11, bold=False),
+                    entry.get("updated_at", ""),
+                    TEXT_MUTED,
+                    (slot.right - 14, slot.top + 14),
+                    anchor="topright",
+                )
+
+                # Chips / Pot / Street line
+                street_txt = entry.get("street", "pre_flop").replace("_", "-").upper()
+                chips_txt = f"Your Chips: ${entry['human_chips']}"
+                chips_rect = draw_text(surface, fonts.get(13, bold=True), chips_txt, GOLD_BRIGHT, (slot.left + 14, slot.top + 44))
+                pot_txt = f"   •   Pot: ${entry.get('pot', 0)}   •   {street_txt}"
+                draw_text(surface, fonts.get(12, bold=False), pot_txt, TEXT_SECONDARY, (chips_rect.right, slot.top + 45))
+
+                # Opponents list
+                opps = entry.get("opponents", [])
+                opp_parts = []
+                for opp in opps:
+                    label = opp["name"]
+                    if opp.get("eliminated"):
+                        label += " (OUT)"
+                    opp_parts.append(label)
+                rivals_text = "Rivals: " + (", ".join(opp_parts) if opp_parts else "AI")
+                if len(rivals_text) > 54:
+                    rivals_text = rivals_text[:51] + "..."
+                draw_text(surface, fonts.get(12, bold=False), rivals_text, TEXT_SECONDARY, (slot.left + 14, slot.top + 70))
+
+                self.resume_btns[idx].label = "Return" if is_current else "Resume"
+                self.resume_btns[idx].draw(surface, fonts)
+                self.delete_btns[idx].draw(surface, fonts)
+            else:
+                pygame.draw.rect(surface, (15, 21, 31), slot, border_radius=10)
+                pygame.draw.rect(surface, (36, 46, 62), slot, width=1, border_radius=10)
+                draw_text(
+                    surface,
+                    fonts.get(13, bold=False),
+                    f"Slot #{idx + 1}  —  Empty",
+                    TEXT_MUTED,
+                    slot.center,
+                    anchor="center",
+                )
+
+        draw_text(
+            surface,
+            fonts.get(11, bold=False),
+            "Completed matches are automatically cleared from save slots.",
+            TEXT_MUTED,
+            (left, self.modal_rect.bottom - 36),
+            anchor="midleft",
+        )
+        self.close_btn.draw(surface, fonts)

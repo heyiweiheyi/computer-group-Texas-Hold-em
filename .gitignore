@@ -2,4 +2,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .local_commit
+saved_matches.json
+saved_matches.json.tmp
 

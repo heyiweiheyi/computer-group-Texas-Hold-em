@@ -1,7 +1,9 @@
 """Tests for the state-driven multi-player session, side pots, runouts, updater, and headless UI."""
 
 import io
+import json
 import os
+import random
 import tempfile
 import unittest
 import zipfile
@@ -17,6 +19,7 @@ from texas_holdem import (
     estimate_all_in_equities,
 )
 from texas_holdem_gui import PokerTableApp
+from ui_saves import MAX_SAVED_MATCHES, MatchSaveManager
 from ui_updater import LOCAL_COMMIT_FILE, apply_zip_update, check_for_updates
 
 
@@ -336,8 +339,214 @@ class HeadlessGuiTests(unittest.TestCase):
             app.rules_modal.visible = True
             app.show_log = True
             app.render()
+            app.rules_modal.visible = False
+            app.saves_modal.visible = True
+            app.render()
         finally:
             pygame.quit()
+
+
+class SaveAndResumeTests(unittest.TestCase):
+    def test_session_serialization_roundtrip_mid_hand_and_run_it_twice(self):
+        random.seed(2026)
+        opponents = [AI_ROSTER[0], AI_ROSTER[1], AI_ROSTER[10]]
+        session = TexasHoldemSession(
+            starting_chips=500,
+            small_blind=5,
+            big_blind=10,
+            opponents=opponents,
+        )
+        while session.phase == "computer_turn":
+            session.step_computer_turn()
+
+        raw_json = json.dumps(session.to_dict(), ensure_ascii=False)
+        restored = TexasHoldemSession.from_dict(json.loads(raw_json))
+
+        self.assertEqual(restored.hand_number, session.hand_number)
+        self.assertEqual(restored.phase, session.phase)
+        self.assertEqual(restored.street, session.street)
+        self.assertEqual(restored.game.pot, session.game.pot)
+        self.assertEqual(
+            [p.name for p in restored.game.players],
+            [p.name for p in session.game.players],
+        )
+        self.assertEqual(
+            [p.chips for p in restored.game.players],
+            [p.chips for p in session.game.players],
+        )
+        self.assertEqual(
+            [(c.rank, c.suit) for c in restored.game.players[0].hole_cards],
+            [(c.rank, c.suit) for c in session.game.players[0].hole_cards],
+        )
+        self.assertEqual(restored.game.players[1].tier, "Ultra")
+        self.assertEqual(restored.game.players[1].tag, "Anthropic")
+        self.assertEqual(len(restored.game.deck.cards), len(session.game.deck.cards))
+
+        # Now force an all-in Run It Twice showdown and verify Card identity after reload
+        session.game.players[0].chips = 120
+        session.game.players[1].chips = 120
+        session.game.players[2].chips = 0
+        session.game.players[3].chips = 0
+        session.game.folded = [False, False, True, True]
+        session.game.eliminated = [False, False, True, True]
+        session.game.round_bets = [0, 0, 0, 0]
+        session.game.hand_contributions = [0, 0, 0, 0]
+        session.game.pot = 0
+        session.game.board = []
+        session.street = "pre_flop"
+        session.pending = [0, 1]
+        session.phase = "waiting_human"
+        session.submit_human_action({"action": "all_in"})
+        if session.phase == "computer_turn":
+            session._apply_action_and_advance(1, {"action": "call"})
+        self.assertEqual(session.phase, "choose_run_count")
+        session.choose_run_count(2)
+        while session.phase == "reveal_board":
+            session.step_reveal_board()
+        self.assertEqual(session.phase, "hand_over")
+
+        rit_restored = TexasHoldemSession.from_dict(json.loads(json.dumps(session.to_dict())))
+        self.assertEqual(rit_restored.run_count, 2)
+        self.assertEqual(len(rit_restored.run_boards), 2)
+        self.assertEqual(len(rit_restored.run_results), 2)
+        # Card objects in best_five must share identity with hole_cards / run_boards for UI highlight
+        r1_pool = set(rit_restored.run_boards[0])
+        for p in rit_restored.game.players[:2]:
+            r1_pool.update(p.hole_cards)
+        for p_res in rit_restored.run_results[0]["player_results"].values():
+            for card in p_res["best_five"]:
+                self.assertIn(card, r1_pool)
+
+    def test_save_manager_keeps_three_unfinished_matches_and_clears_finished(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mgr = MatchSaveManager(tmpdir, persist=True)
+            ids = []
+            for idx in range(4):
+                s = TexasHoldemSession(
+                    starting_chips=500 + idx * 100,
+                    opponents=[AI_ROSTER[idx], AI_ROSTER[idx + 1]],
+                )
+                s.hand_number = idx + 1
+                sid = mgr.save_match(None, s)
+                ids.append(sid)
+
+            # Only the 3 most recent unfinished matches are retained
+            saves = mgr.list_saves()
+            self.assertEqual(len(saves), MAX_SAVED_MATCHES)
+            self.assertEqual([item["id"] for item in saves], [ids[3], ids[2], ids[1]])
+
+            # Reload from disk into a fresh manager
+            mgr2 = MatchSaveManager(tmpdir, persist=True)
+            self.assertEqual(mgr2.count(), 3)
+            loaded = mgr2.load_session(ids[2])
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.hand_number, 3)
+
+            # Updating an existing slot does not duplicate and moves it to slot #1
+            loaded.hand_number = 7
+            mgr2.save_match(ids[2], loaded)
+            self.assertEqual(mgr2.count(), 3)
+            self.assertEqual(mgr2.list_saves()[0]["id"], ids[2])
+            self.assertEqual(mgr2.list_saves()[0]["hand_number"], 7)
+
+            # Finishing a match automatically deletes its save slot
+            loaded.phase = "match_over"
+            mgr2.save_match(ids[2], loaded)
+            self.assertEqual(mgr2.count(), 2)
+            self.assertNotIn(ids[2], [item["id"] for item in mgr2.list_saves()])
+
+    def test_opponent_select_returns_to_table_when_unchanged_and_saves_on_change(self):
+        os.environ["SDL_VIDEODRIVER"] = "dummy"
+        os.environ["SDL_AUDIODRIVER"] = "dummy"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                app = PokerTableApp(
+                    headless=True,
+                    start_screen="title",
+                    check_updates=False,
+                    save_dir=tmpdir,
+                )
+                self.assertEqual(app.save_manager.count(), 0)
+
+                # Start a 4P match with Claude, Jtt, Xrh
+                initial_opps = [AI_ROSTER[0], AI_ROSTER[1], AI_ROSTER[10]]
+                app._start_fresh_match(
+                    {
+                        "opponents": initial_opps,
+                        "num_computers": 3,
+                        "starting_chips": 500,
+                        "small_blind": 5,
+                        "big_blind": 10,
+                    },
+                    new_slot=True,
+                )
+                first_save_id = app.active_save_id
+                first_hand_cards = [(c.rank, c.suit) for c in app.session.game.players[0].hole_cards]
+                self.assertEqual(app.save_manager.count(), 1)
+
+                # Click Table: 3 AI to enter opponent selection mid-match
+                app.select_screen.sync_from_session(
+                    app.session,
+                    can_resume=True,
+                    active_cfg=app._current_match_config(),
+                )
+                app.screen_mode = "select"
+                self.assertTrue(app.select_screen.can_resume)
+                self.assertTrue(app.select_screen.is_unchanged_from_active())
+
+                # Pressing Enter when unchanged resumes the exact same match without resetting
+                app.handle_event(pygame.event.Event(pygame.KEYDOWN, {"key": pygame.K_RETURN}))
+                self.assertEqual(app.screen_mode, "table")
+                self.assertEqual(app.active_save_id, first_save_id)
+                self.assertEqual(
+                    [(c.rank, c.suit) for c in app.session.game.players[0].hole_cards],
+                    first_hand_cards,
+                )
+
+                # Go back to select, toggle Claude off & back on -> still unchanged -> resumes
+                app.select_screen.sync_from_session(
+                    app.session,
+                    can_resume=True,
+                    active_cfg=app._current_match_config(),
+                )
+                app.screen_mode = "select"
+                app.select_screen._toggle_ai("Claude")
+                app.select_screen._toggle_ai("Claude")
+                self.assertTrue(app.select_screen.is_unchanged_from_active())
+
+                # Now swap Xrh -> Qzr, then press ESC (Back to Table) -> cancels change & returns
+                app.select_screen._toggle_ai("Xrh")
+                app.select_screen._toggle_ai("Qzr")
+                self.assertFalse(app.select_screen.is_unchanged_from_active())
+                app.handle_event(pygame.event.Event(pygame.KEYDOWN, {"key": pygame.K_ESCAPE}))
+                self.assertEqual(app.screen_mode, "table")
+                self.assertEqual(app.active_save_id, first_save_id)
+                self.assertIn("Xrh", [p.name for p in app.session.game.players])
+
+                # Swap Xrh -> Qzr and confirm Start New Match -> archives old match & starts new one
+                app.select_screen.sync_from_session(
+                    app.session,
+                    can_resume=True,
+                    active_cfg=app._current_match_config(),
+                )
+                app.screen_mode = "select"
+                app.select_screen._toggle_ai("Xrh")
+                app.select_screen._toggle_ai("Qzr")
+                app.handle_event(pygame.event.Event(pygame.KEYDOWN, {"key": pygame.K_RETURN}))
+                self.assertEqual(app.screen_mode, "table")
+                self.assertNotEqual(app.active_save_id, first_save_id)
+                self.assertIn("Qzr", [p.name for p in app.session.game.players])
+                self.assertEqual(app.save_manager.count(), 2)
+
+                # Resume the first unfinished match from its save slot
+                self.assertTrue(app._resume_saved_match(first_save_id))
+                self.assertEqual(app.active_save_id, first_save_id)
+                self.assertEqual(
+                    [(c.rank, c.suit) for c in app.session.game.players[0].hole_cards],
+                    first_hand_cards,
+                )
+            finally:
+                pygame.quit()
 
 
 if __name__ == "__main__":

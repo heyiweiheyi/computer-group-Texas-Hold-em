@@ -180,7 +180,11 @@ def apply_zip_update(app_dir, zip_bytes, target_sha=""):
             rel_parts = parts[1:]
             if not rel_parts or any(p in ("", ".", "..") for p in rel_parts):
                 continue
-            if rel_parts[0] in (".git", "__pycache__") or rel_parts[-1] == LOCAL_COMMIT_FILE:
+            if rel_parts[0] in (".git", "__pycache__") or rel_parts[-1] in (
+                LOCAL_COMMIT_FILE,
+                "saved_matches.json",
+                "saved_matches.json.tmp",
+            ):
                 continue
 
             dest = os.path.abspath(os.path.join(app_abs, *rel_parts))
