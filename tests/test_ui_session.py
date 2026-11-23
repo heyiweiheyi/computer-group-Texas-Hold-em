@@ -243,22 +243,35 @@ class TexasHoldemSessionTests(unittest.TestCase):
         self.assertFalse(legal_after["can_all_in"])
 
     def test_custom_ai_roster_names_and_tiers(self):
-        by_name = {item["name"]: item["tier"] for item in AI_ROSTER}
-        expected_names = {
-            "Deepseek", "Claude", "Chatgpt", "Gemini", "Glm", "Kimi",
-            "Jtt", "Yuanzuo", "Xrh", "Zch", "Qzr", "Doubao",
+        by_name = {item["name"]: item for item in AI_ROSTER}
+        expected_tags = {
+            "Claude": "Anthropic",
+            "Chatgpt": "Openai",
+            "Jtt": "Rollingwood",
+            "Yuanzuo": "Rollingwood",
+            "Qzr": "Rollingwood",
+            "Xrh": "Rollingwood",
+            "Zch": "Rollingwood",
+            "Deepseek": "DeepSeek",
+            "Glm": "Zcode",
+            "Kimi": "Moonshot",
+            "Gemini": "Google",
+            "Doubao": "ByteDance",
         }
-        self.assertEqual(set(by_name.keys()), expected_names)
-        self.assertEqual(by_name["Claude"], "Ultra")
-        self.assertEqual(by_name["Jtt"], "Ultra")
-        self.assertEqual(by_name["Xrh"], "Rookie")
-        self.assertEqual(by_name["Qzr"], "Rookie")
+        self.assertEqual(set(by_name.keys()), set(expected_tags.keys()))
+        self.assertEqual(by_name["Claude"]["tier"], "Ultra")
+        self.assertEqual(by_name["Jtt"]["tier"], "Ultra")
+        self.assertEqual(by_name["Xrh"]["tier"], "Rookie")
+        self.assertEqual(by_name["Qzr"]["tier"], "Rookie")
+        for name, expected_tag in expected_tags.items():
+            self.assertEqual(by_name[name]["tag"], expected_tag)
 
         chosen = [item for item in AI_ROSTER if item["name"] in ("Claude", "Jtt", "Xrh")]
         session = TexasHoldemSession(starting_chips=500, opponents=chosen)
         self.assertEqual(len(session.game.players), 4)
         self.assertEqual([p.name for p in session.game.players[1:]], [p["name"] for p in chosen])
         self.assertEqual([p.tier for p in session.game.players[1:]], [p["tier"] for p in chosen])
+        self.assertEqual([p.tag for p in session.game.players[1:]], [p["tag"] for p in chosen])
 
 
 class UpdaterTests(unittest.TestCase):

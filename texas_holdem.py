@@ -177,27 +177,28 @@ AI_TIER_SETTINGS = {
 }
 
 AI_ROSTER = [
-    {"name": "Claude", "tier": "Ultra", "style": "GTO Shark"},
-    {"name": "Jtt", "tier": "Ultra", "style": "Final Boss"},
-    {"name": "Gemini", "tier": "Master", "style": "Sharp Reader"},
-    {"name": "Chatgpt", "tier": "Master", "style": "Balanced Ace"},
-    {"name": "Deepseek", "tier": "Master", "style": "Math Tactician"},
-    {"name": "Glm", "tier": "Pro", "style": "Steady Grinder"},
-    {"name": "Kimi", "tier": "Pro", "style": "Patient Stalker"},
-    {"name": "Doubao", "tier": "Pro", "style": "Tricky Caller"},
-    {"name": "Yuanzuo", "tier": "Normal", "style": "Casual Player"},
-    {"name": "Zch", "tier": "Normal", "style": "Loose Gambler"},
-    {"name": "Xrh", "tier": "Rookie", "style": "Card Tourist"},
-    {"name": "Qzr", "tier": "Rookie", "style": "Chip Donor"},
+    {"name": "Claude", "tier": "Ultra", "style": "GTO Shark", "tag": "Anthropic"},
+    {"name": "Jtt", "tier": "Ultra", "style": "Final Boss", "tag": "Rollingwood"},
+    {"name": "Gemini", "tier": "Master", "style": "Sharp Reader", "tag": "Google"},
+    {"name": "Chatgpt", "tier": "Master", "style": "Balanced Ace", "tag": "Openai"},
+    {"name": "Deepseek", "tier": "Master", "style": "Math Tactician", "tag": "DeepSeek"},
+    {"name": "Glm", "tier": "Pro", "style": "Steady Grinder", "tag": "Zcode"},
+    {"name": "Kimi", "tier": "Pro", "style": "Patient Stalker", "tag": "Moonshot"},
+    {"name": "Doubao", "tier": "Pro", "style": "Tricky Caller", "tag": "ByteDance"},
+    {"name": "Yuanzuo", "tier": "Normal", "style": "Casual Player", "tag": "Rollingwood"},
+    {"name": "Zch", "tier": "Normal", "style": "Loose Gambler", "tag": "Rollingwood"},
+    {"name": "Xrh", "tier": "Rookie", "style": "Card Tourist", "tag": "Rollingwood"},
+    {"name": "Qzr", "tier": "Rookie", "style": "Chip Donor", "tag": "Rollingwood"},
 ]
 
 
 class ComputerPlayer(Player):
     """A tiered AI opponent that weighs hand strength, pot odds, and stack commitment."""
 
-    def __init__(self, name, chips, tier="Pro"):
+    def __init__(self, name, chips, tier="Pro", tag=""):
         super().__init__(name, chips, is_human=False)
         self.tier = tier if tier in AI_TIER_SETTINGS else "Pro"
+        self.tag = tag
 
     def _has_draw_bonus(self, board):
         """Return a modest bonus for flush draws on the flop or turn."""
@@ -476,6 +477,7 @@ class TexasHoldemGame:
                         profile["name"],
                         starting_chips,
                         tier=profile.get("tier", "Pro"),
+                        tag=profile.get("tag", ""),
                     )
                 )
         else:

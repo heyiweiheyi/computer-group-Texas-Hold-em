@@ -438,7 +438,7 @@ class OpponentSelectScreen:
             pygame.draw.rect(surface, tc["accent"], stripe, border_radius=3)
 
             # Avatar circle
-            av_center = (rect.left + 44, rect.top + 44)
+            av_center = (rect.left + 44, rect.top + 46)
             pygame.draw.circle(surface, tc["bg"], av_center, 22)
             pygame.draw.circle(surface, tc["border"], av_center, 22, width=2)
             draw_text(
@@ -450,9 +450,23 @@ class OpponentSelectScreen:
                 anchor="center",
             )
 
-            # Name & style
-            draw_text(surface, fonts.get(19, bold=True), name, TEXT_PRIMARY, (rect.left + 78, rect.top + 22))
-            draw_text(surface, fonts.get(12, bold=False), style, TEXT_SECONDARY, (rect.left + 78, rect.top + 48))
+            # Name, style subtitle, and organization/team tag pill
+            draw_text(surface, fonts.get(18, bold=True), name, TEXT_PRIMARY, (rect.left + 78, rect.top + 14))
+            draw_text(surface, fonts.get(11, bold=False), style, TEXT_SECONDARY, (rect.left + 78, rect.top + 38))
+
+            tag_text = profile.get("tag", "")
+            if tag_text:
+                tag_font = fonts.get(10, bold=True)
+                tw = tag_font.size(tag_text)[0]
+                tag_pill = pygame.Rect(rect.left + 78, rect.top + 57, tw + 22, 20)
+                is_rw = tag_text == "Rollingwood"
+                tag_bg = (36, 48, 34) if is_rw else (24, 34, 50)
+                tag_border = (118, 186, 108) if is_rw else PANEL_BORDER
+                tag_fg = (188, 238, 174) if is_rw else (186, 204, 228)
+                pygame.draw.rect(surface, tag_bg, tag_pill, border_radius=6)
+                pygame.draw.rect(surface, tag_border, tag_pill, width=1, border_radius=6)
+                pygame.draw.circle(surface, tag_border, (tag_pill.left + 7, tag_pill.centery), 2)
+                draw_text(surface, tag_font, tag_text, tag_fg, (tag_pill.left + 13, tag_pill.centery), anchor="midleft")
 
             # Seat number pill if selected
             if selected:
