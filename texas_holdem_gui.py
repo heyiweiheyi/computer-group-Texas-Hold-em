@@ -402,7 +402,10 @@ class PokerTableApp:
         if self.session.phase == "hand_over" and previous_phase != "hand_over":
             if self.session.won_this_hand.get(0, 0) > 0:
                 self.sounds.play("win")
-            delay = 0.65 if self.session.win_reason == "showdown" else 0.30
+            if self.session.win_reason == "showdown":
+                delay = 3.8 if self.session.run_count == 2 else 3.2
+            else:
+                delay = 1.6
             self.summary_popup_at = time.monotonic() + delay
 
         self.prev_pot = self.session.game.pot
