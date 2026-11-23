@@ -169,95 +169,158 @@ class Player:
 
 
 class ComputerPlayer(Player):
-    """A simple opponent that makes decisions from hand strength and pot odds."""
+    """A balanced opponent that weighs hand strength, pot odds, and stack commitment."""
 
     def __init__(self, name, chips):
         super().__init__(name, chips, is_human=False)
 
+    def _has_draw_bonus(self, board):
+        """Return a modest bonus for flush draws on the flop or turn."""
+        if len(board) not in (3, 4):
+            return 0.0
+        cards = self.hole_cards + board
+        suit_counts = Counter(card.suit for card in cards)
+        if max(suit_counts.values()) == 4:
+            return 0.11 if len(board) == 3 else 0.07
+        return 0.0
+
     def estimate_strength(self, board):
-        """Return a rough 0-to-1 strength estimate for the computer's current hand."""
+        """Return a calibrated 0-to-1 strength estimate for the computer's current hand."""
         if len(board) >= 3:
             score, _ = evaluate_best_hand(self.hole_cards + board)
             category = score[0]
-            # Hand category is the main signal. A small kicker adjustment breaks ties.
-            return min(0.99, 0.18 + category * 0.095 + score[1] / 300)
+            draw_bonus = self._has_draw_bonus(board)
+
+            if category == 0:
+                base = 0.08 + score[1] / 140.0
+            elif category == 1:
+                board_max = max(card.rank for card in board)
+                pair_rank = score[1]
+                # Distinguish overpair / top pair from middle or bottom pair
+                if pair_rank > board_max:
+                    base = 0.62 + pair_rank / 140.0
+                elif pair_rank == board_max:
+                    base = 0.48 + score[2] / 160.0
+                else:
+                    base = 0.26 + pair_rank / 140.0
+            elif category == 2:
+                base = 0.68 + score[1] / 140.0
+            elif category == 3:
+                base = 0.78 + score[1] / 140.0
+            elif category == 4:
+                base = 0.85
+            elif category == 5:
+                base = 0.89
+            elif category == 6:
+                base = 0.94
+            else:
+                base = 0.98
+            return min(0.99, base + draw_bonus)
 
         first, second = self.hole_cards
         high_rank = max(first.rank, second.rank)
         low_rank = min(first.rank, second.rank)
-        strength = 0.22 + (high_rank - 2) * 0.018 + (low_rank - 2) * 0.008
+        high_norm = (high_rank - 2) / 12.0
+        low_norm = (low_rank - 2) / 12.0
+        gap = high_rank - low_rank
+
+        strength = 0.08 + high_norm * 0.28 + low_norm * 0.14
         if first.rank == second.rank:
-            strength += 0.24
-        if first.suit == second.suit:
-            strength += 0.06
-        if high_rank - low_rank <= 2:
-            strength += 0.04
-        return min(0.85, strength)
+            strength += 0.26 + high_norm * 0.18
+        else:
+            if low_rank >= 10:
+                strength += 0.12
+            if first.suit == second.suit:
+                strength += 0.07
+            if gap <= 1:
+                strength += 0.05
+            elif gap == 2:
+                strength += 0.02
+            elif gap >= 4 and high_rank < 12:
+                strength -= 0.08
+
+        return max(0.05, min(0.95, strength))
+
+    def _pick_raise_amount(self, to_call, min_raise, pot):
+        """Pick a disciplined raise increment above the current bet."""
+        max_raise = max(0, self.chips - to_call)
+        if max_raise < min_raise:
+            return min_raise
+        half_pot = max(min_raise, (pot + to_call) // 2)
+        desired = random.choice([min_raise, min_raise, half_pot])
+        return max(min_raise, min(max_raise, desired))
 
     def choose_action(self, to_call, can_raise, min_raise, pot, board, opponent_all_in):
-        """Return a small action dictionary used by the game's betting round."""
+        """Return a balanced action dictionary using strength, pot odds, and stack pressure."""
         strength = self.estimate_strength(board)
+        # Small per-decision variance so play feels natural rather than mechanical
+        perceived = max(0.0, min(1.0, strength + random.uniform(-0.04, 0.04)))
 
-        if opponent_all_in:
+        if opponent_all_in or (to_call > 0 and to_call >= self.chips):
             if to_call == 0:
                 return {"action": "check"}
-            pot_odds = to_call / max(1, pot + to_call)
-            # Be cautious against an all-in, but sometimes call with a bluff catcher.
-            if strength < 0.18:
-                fold_chance = 0.75 if pot_odds > 0.30 else 0.35
-            elif strength < 0.26:
-                fold_chance = 0.55 if pot_odds > 0.35 else 0.20
-            elif strength < 0.34:
-                fold_chance = 0.35 if pot_odds > 0.45 else 0.12
-            else:
-                fold_chance = 0.0
-
-            if random.random() < fold_chance:
-                return {"action": "fold"}
-            return {"action": "call"}
+            effective_call = min(to_call, self.chips)
+            pot_odds = effective_call / max(1, pot + effective_call)
+            stack_ratio = effective_call / max(1, self.chips)
+            # Facing an all-in requires a genuinely strong hand unless price is tiny
+            threshold = 0.36 + pot_odds * 0.42 + stack_ratio * 0.16
+            if perceived >= threshold + 0.06:
+                return {"action": "call"}
+            if perceived >= threshold - 0.05 and random.random() < 0.30:
+                return {"action": "call"}
+            return {"action": "fold"}
 
         if to_call == 0:
             if can_raise:
-                # Raise more often with a promising hand, and occasionally bluff.
-                if strength >= 0.58:
-                    raise_chance = 0.62
-                elif strength >= 0.40:
-                    raise_chance = 0.32
-                elif strength >= 0.30:
-                    raise_chance = 0.10
+                if perceived >= 0.72:
+                    bet_chance = 0.58
+                elif perceived >= 0.56:
+                    bet_chance = 0.28
+                elif perceived >= 0.44:
+                    bet_chance = 0.10
                 else:
-                    raise_chance = 0.03
+                    bet_chance = 0.03
 
-                if random.random() < raise_chance:
-                    return {"action": "raise", "amount": min_raise}
+                if random.random() < bet_chance:
+                    return {
+                        "action": "raise",
+                        "amount": self._pick_raise_amount(0, min_raise, pot),
+                    }
             return {"action": "check"}
 
         pot_odds = to_call / max(1, pot + to_call)
+        stack_commit = to_call / max(1, self.chips)
+        # Facing a bet: require stronger hands as bet size and stack commitment grow
+        preflop_floor = 0.32 if len(board) == 0 else 0.26
+        required_strength = preflop_floor + pot_odds * 0.48 + stack_commit * 0.36
+
         if can_raise:
-            # Strong hands and some draws now raise more readily when facing a bet.
-            if strength >= 0.58:
-                raise_chance = 0.55
-            elif strength >= 0.45:
-                raise_chance = 0.30
-            elif strength >= 0.34:
-                raise_chance = 0.14
-            elif strength >= 0.28:
-                raise_chance = 0.04
+            # Dampen re-raising when already facing heavy action to avoid endless raise wars
+            heavy_action = stack_commit > 0.20 or to_call > min_raise * 2
+            if perceived >= 0.80:
+                raise_chance = 0.24 if heavy_action else 0.42
+            elif perceived >= 0.66:
+                raise_chance = 0.06 if heavy_action else 0.16
+            elif perceived >= 0.56 and not heavy_action:
+                raise_chance = 0.05
             else:
-                raise_chance = 0.01
+                raise_chance = 0.01 if not heavy_action else 0.0
 
             if random.random() < raise_chance:
-                return {"action": "raise", "amount": min_raise}
+                return {
+                    "action": "raise",
+                    "amount": self._pick_raise_amount(to_call, min_raise, pot),
+                }
 
-        # Against a normal bet, occasionally pay to catch a bluff with a weaker hand.
-        if strength < 0.18:
-            fold_chance = 0.60 if pot_odds > 0.30 else 0.25
-        elif strength < 0.26:
-            fold_chance = 0.35 if pot_odds > 0.35 else 0.10
-        elif strength < 0.34:
-            fold_chance = 0.20 if pot_odds > 0.45 else 0.05
-        else:
+        margin = perceived - required_strength
+        if margin >= 0.07:
             fold_chance = 0.0
+        elif margin >= -0.01:
+            fold_chance = 0.35
+        elif margin >= -0.08:
+            fold_chance = 0.78
+        else:
+            fold_chance = 0.96
 
         if random.random() < fold_chance:
             return {"action": "fold"}
